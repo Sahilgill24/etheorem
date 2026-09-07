@@ -123,15 +123,24 @@ universal `Supported` coverage. As of this writing
 `Proofs/UIntWide.lean`, with no `bv_decide` axiom), `bool`,
 fixed-size `vector` and `list`, `bitvector`, `bitlist` (both via
 the bit-packing inverse in `Proofs/BitPack.lean`), and `container`
-over fixed-size fields (recursively). See
-`Spec/BasicSupported.lean` and the README's *Proof coverage*
-table. Mixed-field containers remain open; the `SSZ.roundtrip`
-user-surface corollary is gated by `BasicSupported r.shape` until
-those land. The asterisk on "verified by inheritance" is
-intentional and small: passing empirical conformance is what
-makes both the performance investment in Phase 4 and the
-research-grade proof investment in Phase 5 well-targeted rather
-than speculative.
+over any field list, whether every field is fixed-size
+(recursively, the `containerFixed` constructor) or the list mixes
+fixed- and variable-size fields (the `containerVar` constructor,
+decoded via the offset-table codec proved in
+`Proofs/ContainerVar.lean` and `Proofs/Roundtrip.lean`'s
+`decode_encode_containerVar_aux`). See `Spec/BasicSupported.lean`
+and the README's *Proof coverage* table. Two gaps remain toward
+universal `Supported` coverage: `vector` / `list` over a
+variable-size element type, and the schema-level
+`maxByteLengthFields fs < MAX_LENGTH` guard on `containerVar`
+(real `BeaconState` / `BeaconBlockBody` shapes sit outside it;
+see etheorem#61 for the value-level relaxation). The
+`SSZ.roundtrip` user-surface corollary is gated by
+`BasicSupported r.shape` until those close too. The asterisk on
+"verified by inheritance" is intentional and small: passing
+empirical conformance is what makes both the performance
+investment in Phase 4 and the research-grade proof investment in
+Phase 5 well-targeted rather than speculative.
 
 **What the cache layer adds.** SSZ's `hash_tree_root` is the dominant cost
 in any consensus-state pipeline: a cold root of `BeaconState` hashes tens
@@ -515,15 +524,15 @@ private def zeroHashRec : Nat → ByteArray
   | 0     => zero32
   | d + 1 => let z := zeroHashRec d; sha256Combine z z
 
-private initialize zeroHashesRef : IO.Ref (Vector ByteArray 65) ←
-  IO.mkRef (Vector.ofFn (fun (i : Fin 65) => zeroHashRec i.val))
+private initialize zeroHashesRef : IO.Ref (Vector ByteArray 100) ←
+  IO.mkRef (Vector.ofFn (fun (i : Fin 100) => zeroHashRec i.val))
 
 @[implemented_by zeroHashesUnsafeImpl]
-private def zeroHashes : Vector ByteArray 65 :=
-  Vector.ofFn (fun (i : Fin 65) => zeroHashRec i.val)
+private def zeroHashes : Vector ByteArray 100 :=
+  Vector.ofFn (fun (i : Fin 100) => zeroHashRec i.val)
 
 def zeroHashAt (H : Type) [Hasher H] (d : Nat) : ByteArray :=
-  if h : d < 65 then zeroHashes.get ⟨d, h⟩ else zero32
+  if h : d < 100 then zeroHashes.get ⟨d, h⟩ else zeroHashRec d
 ```
 
 The runtime body of `zeroHashes` (swapped in via `@[implemented_by]`)
@@ -533,6 +542,19 @@ parameter on `zeroHashAt` is vestigial. It is kept so callers'
 signatures don't change and ignored by the body, because by the
 `sha256Combine_eq_spec` axiom the memoised Sha256 table values
 equal any equivalent hasher's recurrence output.
+
+The table is 100 entries because `merkle_minimal.py`'s `zerohashes`
+is, and the spec indexes that list directly, so `zerohashes[100]`
+raises `IndexError`. Past the memo we continue the same recurrence
+rather than clamping. Merkleization has no error channel to report a
+too-deep lookup into, and a clamped stand-in would split the two
+Merkle paths apart exactly at the table's edge: `Spec.merkleize`
+resolves an empty chunk list through one lookup, while
+`Node.ofLeaves` builds `pair` nodes to whatever depth it is handed.
+Continuing the recurrence keeps them equal at every depth.
+`SizzLeanTests/ZeroHashDepth.lean` pins both sides of the boundary.
+No SSZ type goes near it: `MAX_LENGTH = 2^32` caps a real tree at
+depth 34, and `VALIDATOR_REGISTRY_LIMIT = 2^40` at 40.
 
 A 2⁴⁰-leaf list with one entry populated holds 40 real `pair`
 nodes on the populated path and a single shared `zeroLeaf` per
@@ -705,8 +727,8 @@ common case of "fix one hasher across many content types" becomes
 
 The two type names are *the same type* (`CachedSSZ` is an `abbrev`
 over `TreeBacked`). `TreeBacked` is the *internal* spelling used
-inside `packages/SizzLean/SizzLean/Cache/TreeBacked.lean` where the Merkle tree is
-load-bearing (gindex paths, `setManyAt` walker, cache slots);
+inside `packages/SizzLean/SizzLean/Cache/TreeBacked.lean` where the Merkle tree does
+the work (gindex paths, `setManyAt` walker, cache slots);
 `CachedSSZ` is the *external* spelling the library presents to
 users who care about "a cached SSZ value" and not the underlying
 tree. The update surface `sszUpdate` lives under `packages/SizzLean/SizzLean/Cache/`
@@ -1291,7 +1313,7 @@ graph LR
   invariant maintained by smart constructors, not a kernel-checked
   proposition).
 - The deriving handler's emitted iso (it produces `rfl` proofs, which
-  *are* kernel-checked; the metaprogramming itself is not load-bearing).
+  *are* kernel-checked; the metaprogramming itself is not trusted).
 - Eth-types instances (just `deriving SSZRepr` on plain structures).
 - Conformance vectors (test data; their results funnel through
   `native_decide` so each *axiom* is in TCB, but the vectors themselves
@@ -1426,16 +1448,27 @@ reachable by qualified path for sibling packages (`EthCLSpecs`'s
 `deriving SSZRepr` infrastructure imports `Spec/Serialize` etc.
 directly) but are not part of the user-facing surface.
 
+**Native-plugin exception: `Proofs/SSZListPush.lean` and
+`Proofs/SSZListGetElem.lean`.** Unlike the other `Proofs/*` modules, these two are
+imported from `SizzLean.lean`. `EthCLSpecs.Proofs.BuilderPendingPayments` and
+`EthCLSpecs.Proofs.IsValidIndexedPayloadAttestation` reach them by qualified path,
+but Lake's `precompileModules` includes native modules only when they are reachable
+from the package's root import graph. Without this root edge, the `.olean` is
+built but the native plugin is unavailable at runtime, and the importing package
+fails with `undefined symbol: initialize_SizzLean_…`. Importing them from
+`SizzLean.lean` keeps them on that graph. A `Proofs/*` module that gains its first
+sibling-package consumer needs the same treatment.
+
 ## 13. Conventions
 
 This document is binding on layout and dependencies. CLAUDE.md is binding
 on style and discipline: imports first; `set_option autoImplicit false`
 per file; PascalCase for types, lowerCamelCase for defs; namespacing
 under `SizzLean.*`; no committed `#eval` / `#check` / `#print`
-(`example : … := by …` and `#guard` are the load-bearing alternatives);
+(`example : … := by …` and `#guard` are the alternatives);
 structural recursion or `termination_by` over `partial def`.
 
-The load-bearing convention specific to this library is **literate by
+The main convention specific to this library is **literate by
 default**:
 
 - Every `*.lean` file under `SizzLean/` opens with a `/-! … -/` module
@@ -1467,7 +1500,7 @@ plans as to the document itself.
 | **2: User surface** | Layer 3 (`SSZRepr` + deriving handler) and the Day-1 `FFI/Sha256` `@[extern] opaque` instance. | FFI/Sha256 has no dependency on the verification frontier. SHA-256 is opaque from Day 1; its NIST-conformance assertion is in the TCB. The `SSZ.roundtrip` user-surface corollary is gated by `BasicSupported r.shape` until Stage 18 widens it. The cached Merkle-tree work (Layer 4) has moved to Phase 4. |
 | **3: Application + empirical validation** | Layer 5 (Eth types) + `SizzLeanTests/Sha256Vectors` (consumes `ethereum/consensus-spec-tests` release vectors). | Conformance runs against the verified spec functions (`SSZ.hashTreeRoot` from Layer 1, uncached). This is the empirical safety net for both the verified and asserted-equivalent paths, and the gating signal for both Phase 4 (performance) and Phase 5 (proofs): passing here is what makes either investment well-targeted. |
 | **4: Production primitives + deferred hardening** | Layer 4 (`Tree`, `TreeBacked`, the cached Merkle layer); pure-Lean `Hasher/Sha256Spec.lean` + `@[csimp]` (removes the FFI assertion from TCB); performance work (`ViewDU`-style deferred-update overlay, batched SHA-256, hash-consing). | All stages independent and order-agnostic among themselves. The cache layer lands here (not Phase 2) because it's a *performance* layer asserted equivalent to the spec; deferring it past empirical validation means its property tests have a known-good reference oracle (the spec, validated in Phase 3). The Approach C `profile%` macro is not on the plan; see §8 for the rationale (no fork through Gloas uses EIP-7495 / EIP-7916 / EIP-8016 forms). |
-| **5: Complete formal verification** | **Stage 18: widen `BasicSupported` toward `SSZType.Supported` / `SupportedBounded`, closing `decode_encode`, `serialize_injective`, `encode_size_le_max` arm by arm.** Currently closed: `uintN 8/16/32/64/128/256`, `bool`, fixed-size `vector` and `list`, `bitvector`, `bitlist`, and `container` over fixed-size fields (recursively). Open: mixed-field containers. | Positioned last by design: empirical conformance from Phase 3 ensures the proof effort targets a known-correct implementation, not a speculative one. The publishable non-malleability artefact lands when the remaining arms close. |
+| **5: Complete formal verification** | **Stage 18: widen `BasicSupported` toward `SSZType.Supported` / `SupportedBounded`, closing `decode_encode`, `serialize_injective`, `encode_size_le_max` arm by arm.** Currently closed: `uintN 8/16/32/64/128/256`, `bool`, fixed-size `vector` and `list`, `bitvector`, `bitlist`, and `container` over any field list (fixed-only, recursively, or mixed fixed/variable via the offset-table codec, subject to `maxByteLengthFields fs < MAX_LENGTH`). Open: `vector` / `list` over a variable-size element type, and the value-level relaxation of the `containerVar` size guard (etheorem#61). | Positioned last by design: empirical conformance from Phase 3 ensures the proof effort targets a known-correct implementation, not a speculative one. The publishable non-malleability artefact lands when the remaining arms close. |
 
 The single highest-risk implementation item is gindex arithmetic in
 `Node.setAt`. Mitigation: structural recursion on an explicit `List Bool`

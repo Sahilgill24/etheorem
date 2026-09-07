@@ -24,7 +24,6 @@ in the Gloas namespace when it is replayed.
 set_option autoImplicit false
 
 open EthCLLib.Spec
-open EthCLSpecs.Fulu
 
 namespace EthCLSpecs.Gloas
 
@@ -35,6 +34,7 @@ inherit computeEpochAtSlot
 inherit computeStartSlotAtEpoch
 inherit getCurrentEpoch
 inherit getPreviousEpoch
+inherit computeTimeAtSlot
 inherit getRandaoMix
 
 -- Balance / validator mutators, accessors, predicates.
@@ -71,6 +71,9 @@ inherit getFinalityDelay
 inherit isInInactivityLeak
 inherit getBalanceChurnLimit
 inherit getActivationExitChurnLimit
+
+-- The churn reservation helper the two overrides below call.
+inherit reserveChurn
 
 -- Gloas (EIP-8061) churn: `get_exit_churn_limit` / `get_activation_churn_limit`
 -- use `CHURN_LIMIT_QUOTIENT_GLOAS`, and `compute_exit_epoch_and_update_churn` uses
@@ -160,6 +163,8 @@ inherit DepositScan
 
 forkdef ppdLoop (deposits : Array PendingDeposit) (finalizedSlot avail : Gwei) (nextEpoch : Epoch) :
     StateTransition DepositScan :=
+  -- Fuel rather than a measure, for the reason Fulu's `ppdLoop` records (§7.2): the scan
+  -- stops on a data-dependent guard rather than on a decreasing quantity.
   -- Fuel is `deposits.size + 1`: the `ndi ≥ deposits.size` guard returns `.done` one step
   -- before exhaustion, so `fuelLoop`'s `exhausted` value is unreachable.
   fuelLoop (deposits.size + 1) ({} : DepositScan) ({} : DepositScan) fun s => do

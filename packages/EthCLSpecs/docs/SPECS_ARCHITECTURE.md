@@ -6,7 +6,7 @@ it, for the Lean 4 consensus-spec library. It sits above its two siblings.
 author writes and what the framework supplies, carries the canonical glossary,
 and states the author/framework boundary table. `FRAMEWORK_ARCHITECTURE.md`
 builds each "framework generates" cell of that table from below. This document
-uses both from the author's side: it shows how the Fulu and Gloas specs are
+uses both from the author's side: it shows how the Fulu, Gloas, and Heze specs are
 organized, ported, tested, and eventually proved, written against the contract
 and on top of the machinery. Read `SPEC_AUTHORING_MODEL.md` first. This document
 quotes its glossary rather than re-coining terms, and cross-references both
@@ -15,7 +15,7 @@ siblings by section title so the links resolve.
 A consensus spec sits at a small intersection. A reader fluent in the Python
 `pyspec` may not have written Lean; a reader fluent in Lean may not know what
 `process_epoch` does. This document teaches both sides as it goes. Where a spec
-term needs grounding it gets a sentence; where a Lean idiom is load-bearing it
+term needs grounding it gets a sentence; where a Lean idiom carries the meaning it
 gets one too.
 
 The thesis it earns: the spec author writes consensus logic and nothing else.
@@ -64,7 +64,7 @@ Both `minimal` and `mainnet` presets are supported from the start, through the
 preset tier system that `FRAMEWORK_ARCHITECTURE.md` builds in its
 preset-constant-config-tier-system section. Minimal comes first for fast
 iteration: its smaller vector widths and shorter epochs make a failing vector
-quick to reproduce. Mainnet vectors exist for both forks and run on demand rather
+quick to reproduce. Mainnet vectors exist for all three forks and run on demand rather
 than on every push, since they are slower. The preset machinery carries both from
 day one, so mainnet is a CI-schedule choice, never a missing capability.
 
@@ -177,14 +177,24 @@ order, and the operations on it sit below that. The layout falls into five layer
 loaded in this order: foundations, the component containers, the state, the state
 operations, and fork choice.
 
+Row 0 is the same in every fork: `Fork.lean`, holding the `fork … from …` lineage
+edge and (in a child) the single feeder import of the parent's library root.
+Nothing else lives there. `inherit` and every capturing form read the lineage
+while they elaborate, so the edge has to be in the environment before any other
+module of the fork elaborates, which pins the file to the first position in the
+intra-fork import chain. The fork's library root cannot hold it, being a
+re-export aggregator that elaborates last. Every other module of the fork imports
+intra-fork only, so `Fork.lean` is the fork's one physical edge to its parent.
+
 The table below is the full Fulu fork in load order. Gloas is the same skeleton
 through the fork diff, minus the PeerDAS-specific files where ePBS supersedes
 them, plus the ePBS files.
 
 | # | File | Layer | Contains |
 |---|------|-------|----------|
+| 0 | `Fork` | foundations | The `fork … from …` lineage edge, plus a child's feeder import of its parent |
 | 1 | `Types` | foundations | Consensus type aliases (`Slot`, `Epoch`, `ValidatorIndex`, `Gwei`, `Root`, `BLSPubkey`, `ParticipationFlags`) over SizzLean basic types and crypto-backend types |
-| 2 | `Constants` | foundations | Universal constant values (`GENESIS_SLOT`, `FAR_FUTURE_EPOCH`, domain tags, flag bits) and the spec's use of `[Preset]` / `[Config]` through `Const.*` |
+| 2 | `Constants` | foundations | This fork's `Preset` / `Config` classes and value sets (declared as a diff over the lineage), its own `Const` entries, and the `inherit Const.*` block replaying the parent's |
 | 3 | `Containers/Fork` | containers | `Fork`, `ForkData` |
 | 4 | `Containers/Checkpoint` | containers | `Checkpoint` |
 | 5 | `Containers/Validator` | containers | `Validator` plus `State`-free predicates (`isActiveValidator`, `isSlashableValidator`, `isEligibleForActivationQueue`) |
@@ -202,7 +212,7 @@ them, plus the ePBS files.
 | 17 | `Containers/BeaconBlockBody` | containers | `BeaconBlockBody` |
 | 18 | `Containers/BeaconBlock` | containers | `BeaconBlock`, `SignedBeaconBlock` |
 | 19 | `State` | state | `BeaconState` definition only; imports all of the containers |
-| 20 | `Time` | operations | `getCurrentEpoch`, `getPreviousEpoch`, `computeEpochAtSlot`, `computeStartSlotAtEpoch`, `computeActivationExitEpoch` |
+| 20 | `Time` | operations | `getCurrentEpoch`, `getPreviousEpoch`, `computeEpochAtSlot`, `computeStartSlotAtEpoch`, `computeActivationExitEpoch`, `computeTimeAtSlot` |
 | 21 | `Signing` | operations | `computeDomain`, `computeSigningRoot`, `getDomain` |
 | 22 | `Randao` | operations | `getRandaoMix` |
 | 23 | `Balances` | operations | `increaseBalance`, `decreaseBalance`, `getTotalBalance` |
@@ -295,7 +305,9 @@ port, the same moment the concern-file set is fixed.
 
 Each fork is a directory of this shape, `EthCLSpecs/Fulu/…` and `EthCLSpecs/Gloas/…`, all
 per-fork through the inheritance mechanism. There is no shared spec layer; the
-framework is the only shared layer. Section 5 explains why a shared layer is
+framework is the only shared layer. A fork's vocabulary is per fork too: its type
+aliases, its constants, and its `Preset` / `Config` classes are all its own, so a
+body file names its own namespace and the framework, nothing else. Section 5 explains why a shared layer is
 neither needed nor wanted. Each section is opened by its header macro,
 `state_section` or `fork_choice_section`, from the effect-monad section of
 `FRAMEWORK_ARCHITECTURE.md`. Fulu's files are the full accumulated spec ported
@@ -412,8 +424,8 @@ container front-end owns why these stay non-SSZ.
 
 Fork-incremental declaration follows two cases, the same two that functions follow.
 An unchanged container is `inherit`ed, not rewritten in the fork. A changed or new
-one is declared in full. There is no append form. SSZ field order is load-bearing
-for serialization and Merkleization, so a fork that changes a container restates
+one is declared in full. There is no append form. SSZ field order decides the serialization
+and the Merkleization, so a fork that changes a container restates
 its complete field list explicitly on the page, checked by conformance, rather
 than merging onto a parent by a rule the reader cannot see.
 
@@ -624,13 +636,30 @@ def upgradeToGloas (pre : Fulu.State) : Gloas.State :=
   ...
 ```
 
-It is the single sanctioned cross-fork reference. It names both forks' `State`
-types, so it lives in Gloas, imports Fulu, and reads Fulu fields by `sszGet`. This
-one explicit dependency does not reintroduce a shared spec layer. A shared layer
-would be a place both forks import for common helpers, which the inheritance
-mechanism removes the need for; `upgradeToGloas` is the opposite, a deliberate
-single edge from the child to the parent, named once, for the one operation that
-genuinely spans two forks.
+It is one of two sanctioned cross-fork references. It names both forks' `State`
+types, so it lives in Gloas, imports the Fulu module it needs, and reads Fulu
+fields by `sszGet`. The other is `Interface.lean`, the pyspec runner, which drives
+the parent spine for the pre-fork blocks of a mixed `fork_transition` vector.
+These two files are the only ones in a child fork that write a qualified parent
+name; every other file names its own namespace and the framework. The count is
+enforced by grep:
+
+```bash
+grep -rn "open EthCLSpecs.Fulu"   packages/EthCLSpecs/EthCLSpecs/{Gloas,Heze}
+grep -rn "import EthCLSpecs.Fulu" packages/EthCLSpecs/EthCLSpecs/Gloas \
+  | grep -v "Fork.lean\|Upgrade.lean\|Interface.lean"
+```
+
+Both boundary files write one further line, `open scoped Downgrade`, which
+activates the generated bridge from the child's `Preset` / `Config` to the
+parent's (`FRAMEWORK_ARCHITECTURE.md` §4.2). That is what lets the conversion run
+under a single `[Preset]` binder while the preset is still symbolic. The bridge
+lives one namespace below the fork, so no other file can reach it.
+
+This does not reintroduce a shared spec layer. A shared layer would be a place
+both forks import for common helpers, which the inheritance mechanism removes the
+need for; the upgrade is the opposite, a deliberate single edge from the child to
+the parent, named once, for the one operation that genuinely spans two forks.
 
 Only `upgradeToGloas` is implemented. `upgradeToFulu` would require an Electra
 state, and Electra is not built, so only the Fulu-to-Gloas `fork` and `transition`
@@ -645,44 +674,40 @@ between forks; the upgrade performs the change on a live state.
 The fork choice is the second state machine, written in `StoreTransition` over
 `Store map` in a section opened by `fork_choice_section`. The `Store` and its `on_*`
 handlers are the fork-choice entry points of the fork interface. The
-`runStateTransition` nested-machine bridge of `FRAMEWORK_ARCHITECTURE.md`'s
+`runNestedStateTransition` nested-machine bridge of `FRAMEWORK_ARCHITECTURE.md`'s
 effect-monad section runs the full state transition inside the `onBlock` handler
 and surfaces any inner failure through `StoreTransitionError.transition`. The
 step-and-check harness shape comes from the conformance framework.
 
-### 7.1 The read layer is pure, the handlers are monadic
+### 7.1 The read layer is monadic, like the handlers
 
-The fork-choice read layer is pure functions over the `Store`. `getHead`,
-`getWeight`, `filterBlockTree`, and their helpers take a `Store` and return a value.
-The `on_*` handlers are the monadic `StoreTransition` actions that mutate the store
-and call the read layer on `(← get)`.
+The fork-choice read layer runs in `StoreTransition`. `getHead`, `getWeight`,
+`filterBlockTree`, and their helpers take a `Store` and return a monadic action; the
+`on_*` handlers mutate the store and call the read layer on `(← get)`.
 
 ```lean
--- read layer: pure, recursive, takes the Store as an argument
-def getWeight (store : Store map) (root : Root) : Gwei := ...
+-- read layer: monadic, recursive, takes the Store as an argument
+forkdef getWeight (store : Store map) (root : Root) : StoreTransition Gwei := ...
 
 -- handler: monadic, mutates the store, calls the read layer on the current store
 forkdef onBlock (signedBlock : SignedBeaconBlock) : StoreTransition Unit := do
   let store ← get
   ...
-  let post ← runStateTransition pre (stateTransition signedBlock)
+  let post ← runNestedStateTransition pre (stateTransition signedBlock)
   ...
 ```
 
-This diverges from the monadic state-transition accessors of Section 5, and the
-divergence is deliberate. The fork-choice reads are genuinely recursive: `getHead`
-walks the block tree, `getWeight` sums a subtree, `filterBlockTree` prunes
-recursively. A pure recursive function takes a clean `termination_by` measure on its
-argument and reasons cleanly in a later proof. Monadic recursion would drag the
-termination proof and the equation lemmas through the monad for read-only walks that
-never mutate, which is friction for no gain. Purity is infectious upward: a pure walk
-cannot call a monadic accessor, so the whole read layer is pure together.
+The reads have to be able to reject, which settles the choice. `store.blocks[root]` is a
+plain `Dict` subscript in the spec, so a missing root raises `KeyError`, and the weight
+path's `uint64` arithmetic raises on overflow. A `Gwei`-valued pure function has nowhere
+to put that: it has to supply a default, and a vector that should reject then passes.
+Rejection is infectious upward, so once a leaf read can raise, every walk above it is
+monadic too. That is why the layer moved as a unit, and why a monadic walk calling either
+a pure or a monadic helper is the invariant that holds here.
 
-The same principle drives both machines: be monadic only where it helps and does not
-hurt. It lands on monadic in the state transition because the accessors read the
-threaded state and do not recurse, and it lands on pure here because the recursion
-makes monadic hurt. The state-transition accessors of Section 5 and the fork-choice
-reads here are two applications of one rule, not a contradiction.
+This matches the monadic state-transition accessors of Section 5 for the same reason: in
+both machines a spec-faithful read is one that can fail. Termination is independent of
+the choice, and §7.2 covers it.
 
 ### 7.2 Per-loop termination
 
@@ -695,11 +720,36 @@ invariant proof at definition time. The framework's `fuelLoop` defers that proof
 the cost of a defined-but-unreachable default branch.
 
 The per-loop rule is explicit. Default to well-founded recursion when the measure is
-clean. `getHead`, for instance, has a clean measure when child slots strictly
-increase, so `maxSlot - currentSlot` strictly decreases and `termination_by` closes
-it. Reach for `fuelLoop` only when the up-front invariant proof would block the
-definition from existing before proofs are in scope. Record the choice and its reason
-at each such loop, so a later reader knows whether a bound is honest or deferred.
+clean, and reach for `fuelLoop` when the up-front invariant proof would block the
+definition from existing before proofs are in scope. Two things get recorded, and they
+sit at different scopes.
+
+The **bound** is per site, always. Each loop names the count it is bounded by and the
+value a fuel-out would return, because both are specific to that loop and a reader
+checking whether the bound holds has to read it there.
+
+The **reason** for choosing fuel over a measure may be recorded once for a group of
+loops that share it, at the section heading that group. The reason is uniform across
+the fork-choice walks, and restating one sentence at every site buys nothing. Two
+conditions come with that allowance: the heading has to actually head the loops it
+speaks for, and a loop under a later heading carries the reason in its own docstring
+rather than relying on a heading further up the file. A loop that sits in no such
+group records both at the loop.
+
+Every fork-choice walk currently takes the second option: `getAncestor`,
+`filterBlockTree`, and `getHead` are all `fuelLoop`-bounded, with the block count as
+the bound. The read layer being monadic (§7.1) is what tips it. `getHead` has a clean
+measure on paper, since `maxSlot - currentSlot` strictly decreases when child slots
+increase, but discharging it through `StoreTransition` means carrying the measure past
+a step that can reject, which is the up-front proof this rule defers. The bounds are
+therefore deferred rather than honest.
+
+The loops outside fork choice are bounded for their own reasons, not this one, so each
+records the reason at the loop: the queue scans in `EpochProcessing.lean` and the
+balance-weighted sampler in `Committees.lean` stop on a data-dependent guard rather
+than on a decreasing measure, and `on_tick`'s per-slot catch-up runs on a bound that is
+exact only at the pinned presets, which is why it throws on fuel-out
+(`fuelIterateM!`) instead of returning.
 
 ---
 
@@ -787,7 +837,7 @@ every use site and never classifies the tier there.
 |---|---|---|---|
 | Preset (`[Preset]`) | the `minimal` and `mainnet` instances | `SLOTS_PER_EPOCH` (8 / 32), `SLOTS_PER_HISTORICAL_ROOT` (64 / 8192) | `PTC_SIZE` (16 / 512) |
 | Universal | a `Const` abbrev with a literal body | `FAR_FUTURE_EPOCH`, `VALIDATOR_REGISTRY_LIMIT`, the `DOMAIN_*` tags | `BUILDER_REGISTRY_LIMIT` |
-| Config (`[Config]`) | the `[Config]` instance | `GENESIS_FORK_VERSION`, `SECONDS_PER_SLOT` | `GLOAS_FORK_EPOCH` |
+| Config (`[Config]`) | the `[Config]` instance | `GENESIS_FORK_VERSION`, `SLOT_DURATION_MS` | `GLOAS_FORK_EPOCH` |
 
 The preset-varying values go into the `minimal` and `mainnet` `[Preset]` instances,
 the fixed values into universal `Const` abbrevs, and the network values into the
@@ -798,20 +848,27 @@ that `Const.camelCase` projection.
 
 ### 9.1 The tier system is per fork
 
-The tier system is per fork, not shared. Each fork has its own `Preset` and `Config`
-classes and its own `Const` abbrevs. Gloas inherits Fulu's through the inheritance
-mechanism and appends the ePBS constants: `PTC_SIZE` to the preset tier,
-`BUILDER_REGISTRY_LIMIT` to the universal tier, `GLOAS_FORK_EPOCH` to the config
-tier.
+The tier system is per fork. Each fork has its own `Preset` and `Config` classes
+and its own `Const` entries. A child declares its classes with `forkpreset` /
+`forkconfig`, naming only the fields it adds; the framework merges those with the
+ancestors' along the lineage and emits one flat class in the child's namespace.
+Its `Const` entries arrive the same way as everything else, one `inherit` line
+per name, and it declares its own beside them. Gloas adds `PTC_SIZE` and
+`BUILDER_REGISTRY_LIMIT` to its preset tier and `GLOAS_FORK_VERSION` to its
+config tier; Heze adds `INCLUSION_LIST_COMMITTEE_SIZE`.
 
-This is forced by container-cap late-binding, not a stylistic choice. A container
-cap names `Const.x`, so an inherited container must resolve that constant to the
-running fork's tier. A shared constants layer could not provide that, because the
-inherited container's cap would early-bind to the shared symbol rather than the
-child fork's value, and it would contradict the no-shared-spec-layer rule of
-Section 3. Both `minimal` and `mainnet` instances are supplied from the start, as
-`@[reducible] def`s injected at the test boundary, so the spec is generic over the
-preset and the runner picks per test.
+Container-cap late binding forces this. A container cap names `Const.x`, so an
+inherited container has to resolve that constant to the running fork's tier. A
+shared constants layer could not provide it: the inherited container's cap would
+early-bind to the shared symbol and miss the child fork's value, and the layer
+would contradict the no-shared-spec-layer rule of Section 3.
+
+Both `minimal` and `mainnet` are supplied from the start, as `@[reducible] def`s
+injected at the test boundary, so the spec is generic over the preset and the
+runner picks per test. Each fork owns its own copies of those too, so the runner
+injects `Gloas.minimal` against Gloas code; the fork-upgrade boundary reaches the
+parent's classes through the generated downgrade bridge
+(`FRAMEWORK_ARCHITECTURE.md` §4.2) rather than through a second injection.
 
 ---
 
@@ -833,21 +890,21 @@ interface and `PySpecTests`, written once and fork-agnostic, runs every format.
 | `rewards/*` | a single delta function | yes |
 | `fork_choice` | the `on_*` handlers | yes |
 | `genesis` | `initializeBeaconStateFromEth1` | yes |
-| `fork` | `upgradeToGloas` | yes (Fulu to Gloas only) |
-| `transition` | `stateTransition` with `upgradeToGloas` mid-fold | yes (Fulu to Gloas only) |
-| `ssz_static` | each container's `SSZRepr` (decode, hash-tree-root, round-trip) | yes (Fulu + Gloas) |
+| `fork` | `upgradeToGloas` / `upgradeToHeze` | yes (Fulu→Gloas, Gloas→Heze) |
+| `transition` | `stateTransition` with the upgrade mid-fold | yes (Fulu→Gloas, Gloas→Heze) |
+| `ssz_static` | each container's `SSZRepr` (decode, hash-tree-root, round-trip) | yes (Fulu + Gloas + Heze) |
 | `bls`, `kzg` | n/a | no (crypto-backend concern) |
 
 The `rewards/*` format is in scope and drives a single delta function in isolation,
 the reward and penalty deltas of the `Rewards` concern file (row 29). `fork` and
-`transition` run only the Fulu-to-Gloas upgrade, since Electra is not built. Both
-presets run; mainnet runs on demand rather than on every CI pass.
+`transition` run the Fulu-to-Gloas and Gloas-to-Heze upgrades only, since Electra is
+not built. Both presets run; mainnet runs on demand rather than on every CI pass.
 
 ### 10.2 The reject-faithfulness audit
 
 The audit reads the classify-mode bucket of the error model against each vector's
 valid-or-invalid marking. The vectors are the operational reference, so matching the
-verdict is necessary but not sufficient; the audit checks that the spec rejects at
+answer is necessary but not sufficient; the audit checks that the spec rejects at
 the same point and for the same reason the upstream pyspec does.
 
 | Vector marking | Faithful result | A failure |
@@ -890,6 +947,13 @@ dependency level, not the spec level. SizzLean's cache-coherence test proves
 handle the hasher, so there is no spec-level fast-equals-pure theorem to prove. The
 specs inherit the gap-closing from the dependency.
 
+Both machines are pinned this way. `Proofs/Gloas/Run.lean` names the pure monad for the state
+machine; `Proofs/Gloas/ForkChoiceRun.lean` names it for the store machine and proves a
+fork-choice `forkdef` at it. A handler that runs the state machine picks up its nested
+monad from `NestedStateMachine` (`FRAMEWORK_ARCHITECTURE.md` §7.2), keyed on the store's
+own monad, so pinning the pure store monad pins the pure state monad with it and no fast
+configuration reaches a fork-choice proof.
+
 ### 11.2 The hasher is per goal
 
 The hasher is a per-goal axis, not a fast-versus-pure bundle. Symbolic
@@ -922,20 +986,20 @@ The pinned version per fork is the `pyspecPinnedVersion` constant of the contrac
 spec-revision-pin section: the latest upstream tag carrying that fork's vectors,
 stable or pre-release. Fulu pins a stable release. Gloas tracks the consensus-specs
 main branch, so it pins a pre-release or alpha tag, or a dev commit, while it is
-unreleased. The two forks sit at different pins at the same time.
+unreleased. Forks can sit at different pins at the same time.
 
 The values below are illustrative and are bumped to the current latest release at
-implementation time (the pytest harnesses pin `v1.7.0-alpha.10` at this writing);
+implementation time (the pytest harnesses pin `v1.7.0-alpha.11` at this writing);
 the implementation also confirms the chosen tag
-actually carries Gloas vectors, falling back to a dev commit if not.
+actually carries the newest ported fork's vectors, falling back to a dev commit if not.
 
 ```lean
 namespace EthCLSpecs.Fulu
-def pyspecPinnedVersion : String := "v1.7.0-alpha.10"   -- latest release at writing
+def pyspecPinnedVersion : String := "v1.7.0-alpha.11"   -- latest release at writing
 end EthCLSpecs.Fulu
 
 namespace EthCLSpecs.Gloas
-def pyspecPinnedVersion : String := "v1.7.0-alpha.10"   -- same tag while Gloas is unreleased
+def pyspecPinnedVersion : String := "v1.7.0-alpha.11"   -- same tag while Gloas is unreleased
 end EthCLSpecs.Gloas
 ```
 
@@ -979,7 +1043,7 @@ monadic split of Section 5.
 
 What the framework now generates the author no longer hand-rolls. The experiment
 wrote size proofs and derived instances by hand; `forkcontainer` derives them. It
-wired the monad and the discharge by hand; the header macros and `runStateTransition`
+wired the monad and the discharge by hand; the header macros and `runNestedStateTransition`
 do that. It hand-maintained constants; the per-fork tier system carries them. And it
 had no cross-fork inheritance; the inheritance mechanism supplies it. The experiment
 proved the consensus shape was right. The framework regenerates that shape

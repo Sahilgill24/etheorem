@@ -247,7 +247,7 @@ spec functions in Phase 3.
 The cached Merkle-tree work (`Tree`, `TreeBacked`) that originally
 lived here as the "production-primitives track" has moved to
 Phase 4. It's a *performance* layer, asserted equivalent to the
-spec rather than load-bearing for correctness, so it earns its
+spec rather than required for correctness, so it earns its
 keep after empirical conformance validates the spec it sits on
 top of. Same "validate first, then build" principle the proof
 work in Stage 18 follows.
@@ -438,7 +438,7 @@ several independent satellites:
   serialise. `Node` is the library; `setAt` works on it; `TreeBacked`
   is the user-facing scaffold (14a); `Node.ofShape` makes the cache
   *useful* (14b); cached `setField` / `setIndex` (14c) is the
-  load-bearing operation; **`sszUpdate t with f := v, g := w`
+  central operation; **`sszUpdate t with f := v, g := w`
   syntax (14d)** ships the ergonomic surface plus a per-statement
   batched walker (`setManyAt`). This whole chain lands before any
   perf work because the perf optimisations in Stage 17 all assume
@@ -964,7 +964,7 @@ gates moved from `packages/SizzLean/SizzLeanTests/` to a *separate*
 `lean_lib SizzLeanTests` at namespace `Tests.*`.
 Default `lake build` builds only the library proper (the
 in-file NIST §B gates in `Hasher/Sha256Spec.lean` plus structural
-lemmas stay there, they're load-bearing for the spec's
+lemmas stay there, they're required for the spec's
 correctness at definition time). `lake build SizzLeanTests`
 runs the full empirical suite (CAVP, randomised property tests,
 `TreeBacked` coherence sweeps). Lets day-to-day iteration stay
@@ -1408,7 +1408,7 @@ Replaces the Stage 5–6 first-cut theorems on `BasicSupported`.
 | `.container fs` (general, `BasicSupportedFieldsFixed fs`) | ✅ | `Proofs/ContainerFixed.lean` (helpers) + `Proofs/Roundtrip.lean` (mutual block) |
 | `.bitvector n` (`0 < n`) | ✅ | `Proofs/BitPack.lean` (`packBitsLE` / `unpackBitsLEAux` inverse) |
 | `.bitlist cap` | ✅ | `Proofs/BitPack.lean` (inverse + `msbPos` delimiter recovery) |
-| mixed-field `.container` (≥1 variable-size field) | ⏸ outside `Supported` | needs `Supported` extension first |
+| mixed-field `.container` (≥1 variable-size field) | ✅ | `Proofs/ContainerVar.lean` (groundwork) + `Proofs/Roundtrip.lean`'s `decode_encode_containerVar_aux` (offset-table walker) |
 
 Shared prerequisite shipped: `Proofs/SerializeSize.lean`, the
 `size_serialize_eq_fixedByteSize` mutual proof over
@@ -1417,14 +1417,17 @@ prerequisite the composite arms recurse through and is reused by
 the three theorems' composite-arm dispatch.
 
 **Remaining deliverables.**
-- Spec-layer extension for mixed-field containers (out of scope
-  for Stage 18 as currently scoped; it would require a new
-  `containerVar` constructor on `Supported` plus offset-table
-  invariants).
+- `vector` / `list` over a variable-size element type
+  (`vectorVar` / `listVar`, no proof arm yet); the mixed-field
+  container work closed the field-list side of this gap but left
+  the element-type side open.
+- Value-level relaxation of `containerVar`'s
+  `maxByteLengthFields fs < MAX_LENGTH` guard (etheorem#61): the
+  schema-level bound is correct for uint32 offsets, but it
+  excludes the real `BeaconState` / `BeaconBlockBody` shapes
+  whose static max exceeds `2^32`.
 - The `SSZ.roundtrip` user-surface corollary keeps its
-  `BasicSupported r.shape` precondition until mixed-field
-  containers land (blocked one layer deeper, on the `Supported`
-  predicate itself).
+  `BasicSupported r.shape` precondition until that arm lands too.
 
 Shipped since the original scoping:
 `packages/SizzLean/SizzLean/Proofs/BitPack.lean` carries the
@@ -1437,31 +1440,117 @@ by kernel `decide` over the ≤ 2⁸ chunk shapes; the byte-stream
 lift mirrors `packBitsLE`'s own 8-cons match structure so the
 structural checker accepts the recursion.
 
+Mixed-field containers landed via a new `BasicSupportedFields`
+pointwise predicate (every field `BasicSupported`, no
+`isFixedSize` constraint) plus a `containerVar` constructor on
+`BasicSupported` / `Supported` / `SupportedBounded`, each carrying
+`allFixedSize fs = false` and (on `BasicSupported`)
+`maxByteLengthFields fs < MAX_LENGTH`, the uint32-offset-overflow
+guard. The roundtrip walker
+(`decode_encode_containerVar_aux`, mutual with `decode_encode` in
+`Proofs/Roundtrip.lean` for the same structural-recursion reason
+as `containerFixed`) threads two `ByteArray.extract` invariants
+pinning the fixed prefix and variable region to the encoder's
+output, decomposed at each cons step via `Proofs/ContainerVar.lean`'s
+`extract_split`. The `supported_of_basicSupported` subset theorem
+(Stage 18's `Supported`-drift guard) grew a `containerVar` arm in
+the same change, so the two predicates cannot drift apart on this
+constructor either.
+
 **Final acceptance.** Three theorems closed universally over
 `Supported` / `SupportedBounded` with no `sorry`, no `native_decide`
 on the proof path. The current shipping cut closes everything
-*except* mixed-field containers;
-`decode_encode`'s axiom footprint is exactly three
-`_native.bv_decide.ax_*` axioms (from the multi-byte `uintN`
-arms) plus the standard kernel axioms (the bit arms add none), and
-`encode_size_le_max` adds none. Note that the bv_decide axioms are
-a documented deviation from the original Stage 18 acceptance and
-could be removed by replacing `bv_decide` with hand-written
-`BitVec` proofs (substantially more code).
+except `vector` / `list` over a variable-size element type and
+the schema-level `maxByteLengthFields fs < MAX_LENGTH` guard on
+`containerVar` (etheorem#61 tracks the value-level relaxation);
+`decode_encode`'s axiom footprint is exactly four
+`_native.bv_decide.ax_*` axioms (three from the multi-byte `uintN`
+arms, one from the mixed-field container arm's uint32 offset
+codec bridge) plus the standard kernel axioms (the bit arms add
+none), and `encode_size_le_max` adds none. Note that the
+`bv_decide` axioms are a documented deviation from the original
+Stage 18 acceptance and could be removed by replacing `bv_decide`
+with hand-written `BitVec` proofs (substantially more code).
 
 **Risk.** Lowered from the original "highest in project" since
-the composite arms (general `vector` / `list` / `container`) and
-both bit arms are now shipped without the predicted
-research-grade difficulty. The mutual-block trick on
-`(BasicSupported, BasicSupportedFieldsFixed)` resolved the
-closure-termination issue cleanly. Remaining risk concentrates
-in the future mixed-field-container work.
+the composite arms (general `vector` / `list` / `container`,
+fixed-field and now mixed-field) and both bit arms are now shipped
+without the predicted research-grade difficulty. The mutual-block
+trick, first on `(BasicSupported, BasicSupportedFieldsFixed)` and
+then reused on `(BasicSupported, BasicSupportedFields)` for
+`containerVar`, resolved the closure-termination issue cleanly
+both times. Remaining risk concentrates in the still-open
+variable-element `vector` / `list` arm, and in the value-level
+relaxation of `containerVar`'s size guard (etheorem#61).
 
 **Notes.** Each arm's arrival extends `SSZ.roundtrip`
 automatically; downstream Eth-types instances pick up the wider
 corollary without rework. The README's
 [Proof coverage](../README.md#proof-coverage) section carries
 the per-constructor table users see.
+
+### Beyond the three central theorems
+
+Stage 18 covers serialization. Merkleization has no proved
+result yet.
+
+**Merkleization agreement.** Prove `Node.merkleRootWithCache`
+(`Cache/MerkleTree/Merkle.lean`) equal to `hashTreeRoot`
+(`Spec/HashTreeRoot.lean`). Stage 12 checks that the two agree on
+three fixtures by `native_decide`. There is no proof. Without
+one, a theorem about the cached tree's root says nothing about
+the root the spec computes.
+
+The spec merkleizer folds breadth-first with
+level-indexed zero padding while the cached builder splits
+depth-first, so the induction carries a level offset. It needs no
+depth bound beyond that. `zeroHashAt` memoises the first 100
+depths and runs the same `zeroHashRec` recurrence past them. The
+two towers therefore agree at every depth, including the
+cap-derived depths (`list`, `bitlist`) that reach furthest.
+
+Dafny left `hash()` uninterpreted and could only
+differential-test this property. `LeanSha256` and the named
+FFI-equivalence axioms under `Hasher/` make a proof against a
+concrete hash possible.
+
+**Zero tower, padding and chunking.** `zeroHashes`
+(`Cache/MerkleTree/Zero.lean`), `padToChunk`, `chunkDepth` and
+`mixInLength` (`Spec/HashTreeRoot.lean`). Padding and chunking
+are the structural difference between the two merkleizers, so
+these are steps inside the agreement proof. Dafny proved the equivalent
+chunk-count and length bookkeeping, which is the one part of
+merkleization it did reach.
+
+**Generalized-index library.** Decompose `getGeneralizedIndex`
+and `getSubtreeIndex` (`Spec/GeneralizedIndex.lean`) into the
+`(depth, index)` pair the merkleization theorems take. Every
+Merkle-proof consumer needs it. Light-client header branches
+address leaves by generalized index rather than raw tree
+position. The blob and data-column sidecar inclusion proofs do
+the same.
+`kzgCommitmentsInclusionProof`
+(`EthCLSpecs/Fulu/Blocks.lean:63`) is the sidecar case, not
+modeled yet. Deposits are the exception. Their index is a plain
+tree position.
+
+**Branch completeness.** Prove that `isValidMerkleBranch`
+(`EthCLLib/Spec/SigningRoot.lean:68`) accepts the honest opening
+of a SizzLean tree. Dafny never implemented the function, so
+there is no prior statement to reuse. `processDeposit` needs a
+mix-in-length variant. Stated general over depth, that variant
+also serves the sidecar proofs above.
+
+Two gaps separate that from the shipped call sites. Each call site
+checks a branch taken off the wire.
+`EthCLSpecs/Fulu/Operations.lean:225` checks it against the
+deposit contract's incremental tree, which is not an `ofShape`
+tree. The wire value therefore needs its own connection to the
+tree the theorem describes. The light-client sites call
+`is_valid_normalized_merkle_branch`, which pads a short branch
+with a zero prefix. `isValidMerkleBranch` rejects any branch
+whose length differs from the depth, so those openings need the
+normalized form modeled first.
 
 ---
 
@@ -1489,4 +1578,4 @@ the per-constructor table users see.
 | 2: User surface | Stages 7–9 | complete |
 | 3: Application + empirical validation | Stages 10–11, **11.1** | **complete.** `ssz_generic`: **1865/1865 cases pass**. `ssz_static` (minimal preset, full `--all` sweep): **38991/38991 cases pass** across all seven mainline forks (`phase0`, `altair`, `bellatrix`, `capella`, `deneb`, `electra`, `fulu`), zero failures, zero skipped. Conformance pinned at consensus-spec-tests **v1.6.0-beta.0** in `scripts/run_conformance.py` so the Fulu / Gloas containers track the post-v1.5.0 main-branch spec (Fulu BeaconState is now its own struct with `proposer_lookahead`; Gloas BeaconState is its own struct with the nine EIP-7732 ePBS fields). Preset duplication is eliminated by the `ssz_struct_for_presets` macro (`packages/LeanEthCS/LeanEthCS/PresetStruct.lean`); preset-sensitive containers are written once with `@@CONST` / `@%TypeName` placeholders and emitted twice (`.Minimal` / `.Mainnet`). Mainnet validated at `--limit 2` across all forks (1641/1641); mainnet `--all` is a `workflow_dispatch` button. CLI dispatch uses the `<preset>/<fork>:<type>` identifier scheme (legacy `<fork>:<type>` defaults to minimal). **CI integration**: `.github/workflows/lean_action_ci.yml` runs the conformance script at `--limit 1` on every push/PR. **Stage 11.1, harness modernisation:** `eth_ssz_vector_runner batch` mode (one process spawn per sweep, tab-separated request/response over stdin/stdout, ~70× speedup on `ssz_generic`); `tqdm` progress bar; per-fork explicit `Inherited.lean` re-exports in LeanEthCS killing the inheritance heuristic in the dispatcher; Tests/ rename to package-prefixed `SizzLeanTests/` / `LeanSha256Tests/` for umbrella-build namespace disambiguation. EIP-7441 (Whisk) deferred per scope; EIP-7732 (ePBS) Gloas containers tracked (BeaconState shape implemented; supporting types `Builder`, `BuilderPendingPayment`, `BuilderPendingWithdrawal`, and `ExecutionPayloadBid` ship in `Forks/Gloas/`). |
 | 4: Production primitives + deferred hardening | Stages 12, 13, 14a–d, **14e**, 15, 17a–e (Stage 16 dropped, see note) | **Cache backbone + ergonomic surface + Sha256Spec green: 14a–e + 15 in.** Stage 12: three hand-built trees match `Spec.SSZType.hashTreeRoot` via `native_decide`. Stage 13: 200-case randomized property test (`gindexBits` on `List Bool` so the Nimbus Feb-2025 gindex bug class is unrepresentable). Stage 14a: `TreeBacked` scaffold. Stage 14b: `Node.ofShape` produces interior-populated trees byte-identical to the spec; coherence verified on 8 composite types. Stage 14c: cached `setField` operations; property tests pass for 100 + 30 mutations. Stage 14d: `Node.setManyAt` batched walker (100-case property test on disjoint distinct paths) plus `sszUpdate t with f := v, g.h := w, vec[i] := x` term-elaborated syntax (50-case flat-multi + 20-case nested-path + 30-case vector-index + 30-case alias-coverage gates). Index syntax handles both `Vector` and `SSZList` with composite element types; the list path emits the `[false]` mix-in-length prefix automatically. `TreeBacked H T` / `CachedSSZ H T` pin the hasher in the *type*, picked once at `TreeBacked.ofValue` time, then inferred by every downstream `sszUpdate` / `hashTreeRootCached` call; mixing hashers within one cached value is a type error. Two exploratory pieces were tried and removed: a `derive_tree_setters` macro and `TreeBacked/Container.lean` (hand-written setters obsoleted by `sszUpdate`'s index syntax). **Stage 14e, `SSZ.Box` union + curated public surface:** closed inductive over the two cache flavours with four smart constructors (`SSZ.FastBox` / `SSZ.PureBox` Sha256-pinned, `SSZ.CachedBox` / `SSZ.UncachedBox` hasher-explicit); `sszUpdate` extended with two-arm box dispatch; read-side `sszGet b a.b[i].c` macro mirrors `sszUpdate`'s path syntax and expands to `b.view.a.b[i].c` so user code never types `.view`; `CachedSSZ.ofValue` / `.hashTreeRoot` user-facing aliases. Stage 15: pure-Lean `Sha256Spec` ships as a kernel-reducible Lean SHA-256 implementation, validated empirically against the FFI on 185 cases (5 NIST + 100 random combine + 80 random hash). **Stage 17a (pending overlay):** `pending : Std.TreeMap Nat (PendingWrite T)` where `PendingWrite T = T → Option Node` is a closure that reads the current `view` at commit time and returns `none` for view-side no-op writes (OOB index updates). Cross-statement batching is automatic and free; closure-based read-from-view keeps overlapping parent/child writes mutually consistent. **Stage 17b:** batched SHA-256 FFI primitive (`sha256BatchCombine`) shipped with named axiom and equivalence tests; scalar inner loop in `csrc/sha256_batch.c` for now (AVX-512 swap is 17b.1 follow-up, keeps the FFI surface identical). **Stage 17c:** bounded-LRU hash-consing primitive (`Node.mkPair`) shipped opt-in; default cached path bypasses it. **Stage 17d:** `@[specialize]` on the three `SSZ.serialize/deserialize/hashTreeRoot` surfaces. **Stage 17e:** `Node.commitAndHash` fuses commit + root walk into a single spine walk; `Node.ofShape`'s builders (`ofLeaves`, `ofSubtrees`, `mixInLength`) pre-fill `(some root)` cache slots at construction so `merkleRootWithCache` on a fresh subtree short-circuits in O(1) at the top. **Bench (`packages/SizzLean/SizzLeanBench/`, run via `just sizzlean-bench`):** seven scenarios S1–S7 across small (`Validator` / `ValidatorSet16`), large (`ValidatorSet256`), and realistic (`SizzLeanBench.Fulu.BeaconState`, mainnet preset, ~1024 validators) fixtures. Headline rows: **S6 BlockProcessingLarge** ~2.4× cached vs pure; **S7 FuluStateTransition** ~2.0× cached vs pure. S7's Fulu types live in `SizzLeanBench/Fulu.lean` as a bench-local reference copy so `SizzLeanBench` doesn't need a LeanEthCS dependency (`LeanEthCS` already depends on `SizzLean`, so the reverse would close a cycle). |
-| 5: Complete formal verification | Stage 18 | **in progress.** `BasicSupported` now covers `uintN 8 / 16 / 32 / 64`, `bool`, general `vector` / `list` over fixed-size elements, `bitvector` / `bitlist` (the `packBitsLE` / `unpackBitsLEAux` inverse plus `msbPos` delimiter recovery, `Proofs/BitPack.lean`), and general `container` over fixed-size fields (recursively, `bitvector` fields included). Shared prereq `Proofs/SerializeSize.lean` lands the `size_serialize_eq_fixedByteSize` mutual proof. Per-arm proofs split across `Proofs/{UInt,Bool,VectorFixed,ListFixed,ContainerFixed,FixedElems,BitPack,Roundtrip,SizeBound}.lean`; `decode_encode`'s axiom footprint is three `_native.bv_decide.ax_*` (uintN16/32/64, the bit arms add none), `encode_size_le_max`'s is zero non-standard axioms. Mixed-field containers remain outside `SSZType.Supported` itself, separate spec-layer work. See the Stage 18 section above and the README's *Proof coverage* table. |
+| 5: Complete formal verification | Stage 18 | **in progress.** `BasicSupported` now covers `uintN 8 / 16 / 32 / 64 / 128 / 256`, `bool`, general `vector` / `list` over fixed-size elements, `bitvector` / `bitlist` (the `packBitsLE` / `unpackBitsLEAux` inverse plus `msbPos` delimiter recovery, `Proofs/BitPack.lean`), and general `container` over any field list, fixed-only (recursively, `bitvector` fields included, `containerFixed`) or mixed fixed/variable (`containerVar`, the offset-table codec in `Proofs/ContainerVar.lean` + `Proofs/Roundtrip.lean`'s `decode_encode_containerVar_aux`). Shared prereq `Proofs/SerializeSize.lean` lands the `size_serialize_eq_fixedByteSize` mutual proof. Per-arm proofs split across `Proofs/{UInt,UIntWide,Bool,VectorFixed,ListFixed,ContainerFixed,ContainerVar,FixedElems,BitPack,Roundtrip,SizeBound}.lean`; `decode_encode`'s axiom footprint is four `_native.bv_decide.ax_*` (uintN16/32/64 plus the mixed-field container arm's uint32 offset codec bridge; the bit arms and the wide `uintN128/256` arms add none), `encode_size_le_max`'s is zero non-standard axioms. Open gaps: `vector` / `list` over a variable-size element type, and the schema-level `maxByteLengthFields fs < MAX_LENGTH` guard on `containerVar` (etheorem#61). See the Stage 18 section above and the README's *Proof coverage* table. |

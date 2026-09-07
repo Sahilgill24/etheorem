@@ -10,6 +10,11 @@
 #
 # The pyspec recipes need a Python venv. Run `just setup-python` once first.
 
+# xdist worker count for the full pyspec sweeps; `auto` (one per core) is the
+# historical default. Override on memory-constrained machines:
+# `PYTEST_JOBS=2 just ethcl-pyspec-full`.
+pytest_jobs := env_var_or_default("PYTEST_JOBS", "auto")
+
 # List every recipe with its description
 default:
     @just --list --unsorted
@@ -67,6 +72,74 @@ lint:
         printf "Per CLAUDE.md: no sorry / #eval / #check / #print in committed code.\n" >&2 ; \
         exit 1; \
     fi
+
+# Resolve every `File.lean:start-end` citation in
+# `packages/EthCLSpecs/docs/PROOF_LEDGER.md` and the
+# `EthCLSpecs/Proofs/` module docstrings against the declaration it names, and
+# fail on a mismatch. Spans rot silently whenever a cited file grows above the
+# declaration, and refreshing them per-PR leaves the table mixing fresh and
+# stale rows. `--fix` rewrites the stale spans in place. Stdlib-only Python; no
+# .venv needed. The CI `lint` job runs this next to `just lint`.
+
+# Check the line-span citations into the spec bodies (pass --fix to rewrite them)
+[group('general')]
+check-citations args="":
+    python3 scripts/check_citations.py {{ args }}
+
+# Two facts about a spec constant have to match upstream, and neither is visible
+# from the Lean source: its tier (preset file -> `Preset` class, config file ->
+# `Config` class, constants table -> flat literal) and the fork that introduces
+# it. Both rot silently at a re-pin, when upstream moves a value between tiers or
+# a later fork takes over a constant an earlier one owned. A misfiled preset
+# value is a correctness bug, not an untidiness: it can shape an SSZ cap, so the
+# day the two preset files diverge it produces a wrong root and a green build.
+# `--refresh` re-downloads the pinned specs and rewrites
+# `scripts/constant_tiers.json`; run it whenever the pin moves. Stdlib-only
+# Python; only `--refresh` needs the network.
+
+# Check each spec constant's tier and owning fork (pass --refresh after a re-pin)
+[group('general')]
+check-constants args="":
+    python3 scripts/check_constant_tiers.py {{ args }}
+
+# How much of the executable spec is formally verified, read out of the built
+# `.olean`s: every `forkdef` is the denominator, a theorem statement that mentions
+# one puts it at the touched tier, and a `@[characterizes f]` tag puts it at the
+# characterized tier. The report also audits every theorem's axioms and prints the
+# `SizzLean` property matrix. Needs `lake build EthCLSpecs` first; it reads the
+# compiled environment, so it costs seconds and never elaborates a proof again.
+
+# Build the two libraries whose `.olean`s the report reads. Up to date, this
+# costs a second; from cold it is the ordinary build. All three proof-coverage
+# recipes depend on it, so the report can never read a stale environment.
+[private]
+proof-coverage-build:
+    lake build SizzLean EthCLSpecs
+
+# Report proof coverage of the fork bodies and the SSZ properties
+[group('general')]
+proof-coverage: proof-coverage-build
+    lake env lean --run scripts/ProofCoverage.lean
+
+# The ratchet. Exact equality against the committed baselines, one per package
+# (`packages/EthCLSpecs/docs/` for the fork bodies, `packages/SizzLean/docs/` for
+# the SSZ properties), in both directions: a lost proof fails, and a new proof
+# fails until its author commits the bump. A floor-only count would miss a swap of
+# one proof for another. The CI `ethcl` job runs this after the build.
+
+# Fail when proof coverage drifts from the committed baseline
+[group('general')]
+proof-coverage-check: proof-coverage-build
+    lake env lean --run scripts/ProofCoverage.lean -- --check
+
+# Rewrite both baselines and the generated block in the `EthCLSpecs` README from
+# the current build. Run it in the PR that adds or removes a proof, and commit
+# the diff; that diff is the coverage change, under review.
+
+# Rewrite the proof-coverage baselines and README block
+[group('general')]
+proof-coverage-update: proof-coverage-build
+    lake env lean --run scripts/ProofCoverage.lean -- --update
 
 # Check the *build-time native* dependencies only: `pkg-config` (used
 # by lakefile.lean to discover OpenSSL link/cflags) + OpenSSL 3.x (the
@@ -225,7 +298,7 @@ _ensure-venv:
     fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# EthCLSpecs — consensus-spec framework + Fulu / Gloas fork bodies
+# EthCLSpecs — consensus-spec framework + Fulu / Gloas / Heze fork bodies
 #
 # EthCLLib + EthCLSpecs (the consensus-spec framework + Fulu/Gloas bodies). The
 # `*Tests` libs carry the framework + spec `#guard` / `native_decide` self-tests
@@ -233,7 +306,7 @@ _ensure-venv:
 # building them fires the gates.
 # ═════════════════════════════════════════════════════════════════════════
 
-# EthCLLib + EthCLSpecs self-tests (framework + Fulu/Gloas spec gates)
+# EthCLLib + EthCLSpecs self-tests (framework + fork spec gates)
 [group('ethcl')]
 ethcl-test:
     lake build EthCLLib EthCLLibTests EthCLSpecs EthCLSpecsTests
@@ -248,28 +321,31 @@ ethcl-pyspec args="": _ensure-venv
     cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q {{ args }}
 
 # CI smoke gate for EthCLSpecs pyspec: the dev subset (a few cases per
-# handler) at minimal for both forks. Currently-green formats pass; the rest
+# handler) at minimal for all three forks. Currently-green formats pass; the rest
 # xfail as the Phase-2 work-queue, so the run is green (exit 0) iff no in-scope
 # vector hits a bug-smell or a real mismatch. Mainnet / full sweep run on demand.
 
-# CI smoke gate: EthCLSpecs pyspec dev subset for both forks at minimal
+# CI smoke gate: EthCLSpecs pyspec dev subset for all three forks at minimal
 [group('ethcl')]
 ethcl-pyspec-smoke: _ensure-venv
     cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --fork=fulu --subset=2
     cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --fork=gloas --subset=2
+    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --fork=heze --subset=2
 
 # The complete in-scope sweep: every collected vector (`--subset=0`) for the
-# full matrix of {fulu, gloas} × {minimal, mainnet}, sharded across cores. The
-# two minimal forks finish quickly; the two mainnet forks are the long poles
+# full matrix of {fulu, gloas, heze} × {minimal, mainnet}, sharded across cores. The
+# three minimal forks finish quickly; the three mainnet forks are the long poles
 # (real-size SSZ + crypto). Each xdist worker holds its own warm `pyspec_server`.
 
-# Full EthCLSpecs pyspec sweep: {fulu,gloas} × {minimal,mainnet}, sharded across cores
+# Full EthCLSpecs pyspec sweep: {fulu,gloas,heze} × {minimal,mainnet}, sharded across cores
 [group('ethcl')]
 ethcl-pyspec-full: _ensure-venv
-    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n auto --preset=minimal --fork=fulu
-    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n auto --preset=minimal --fork=gloas
-    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n auto --preset=mainnet --fork=fulu
-    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n auto --preset=mainnet --fork=gloas
+    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=minimal --fork=fulu
+    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=minimal --fork=gloas
+    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=minimal --fork=heze
+    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=mainnet --fork=fulu
+    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=mainnet --fork=gloas
+    cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=mainnet --fork=heze
 
 # ═════════════════════════════════════════════════════════════════════════
 # SizzLean — SSZ library
@@ -281,7 +357,7 @@ ethcl-pyspec-full: _ensure-venv
 # boolean, the test-only containers); the EIP-7495 / 7916 / 8016 progressive /
 # stable / compatible forms are out of `SizzLean`'s universe and xfail. The
 # per-fork consensus-container `ssz_static` vectors run inside the EthCLSpecs
-# `ethcl-pyspec*` recipes (Fulu + Gloas), not here.
+# `ethcl-pyspec*` recipes (the fork bodies), not here.
 # ═════════════════════════════════════════════════════════════════════════
 
 # `SizzLeanTests.PendingListShrink` Cases 4/5/7 deliberately drive

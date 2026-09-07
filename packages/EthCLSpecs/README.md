@@ -1,11 +1,13 @@
 # EthCLSpecs
 
-> **Status: experimental, single-developer; personal project, not an EF
-> release. Validated against the pyspec test vectors for two
-> forks (Fulu, Gloas); machine-checked proofs are future work.**
+> **Status: experimental; an independent project with contributors
+> from the Ethereum Protocol Fellowship and the Invisible Garden
+> Fellowship; not an EF release.** Validated against the pyspec test
+> vectors for three forks (Fulu, Gloas, Heze); machine-checked proofs
+> are future work.**
 
-A Lean 4 implementation of the Ethereum consensus specification for the Fulu
-and Gloas forks. It is executable. The SSZ container types, the full
+A Lean 4 implementation of the Ethereum consensus specification for the Fulu,
+Gloas, and Heze forks. It is executable. The SSZ container types, the full
 beacon-chain state transition, the fork upgrade, and fork choice all run, and
 they are checked against Ethereum's pyspec
 [`consensus-spec-tests`](https://github.com/ethereum/consensus-spec-tests)
@@ -20,14 +22,19 @@ packages, through `EthCLLib`, to `EthCLSpecs`.
 
 ## What it covers
 
-Two forks are in scope:
+Three forks are in scope:
 
 - **Fulu** is the base, authored whole. It carries the accumulated
   beacon-chain spec from Phase 0 through Electra, plus Fulu's PeerDAS
   data-availability additions (EIP-7594).
-- **Gloas** is a diff over Fulu. It adds enshrined proposer-builder separation
-  (EIP-7732): a builder registry, execution payload bids, the
+- **Gloas** is a diff over Fulu. It adds ePBS (EIP-7732): a builder
+  registry, execution payload bids, the
   payload-timeliness committee, and a reordered block pipeline.
+- **Heze** is a thin diff over Gloas. It adds fork-choice inclusion lists
+  (EIP-7805 FOCIL): the `InclusionList` container family, the
+  inclusion-list committee helpers, an inclusion-list store folded into the
+  fork-choice store, and the payload satisfaction gate
+  (`is_payload_inclusion_list_satisfied`).
 
 For each fork the library implements the SSZ containers, the state transition
 (slots, blocks, epochs, and every operation), the fork upgrade, and a second
@@ -73,15 +80,24 @@ correct by construction: the child's version binds at every call site in the
 inherited body.
 
 ```lean
-fork Gloas from Fulu      -- declare the lineage once
+fork Gloas from Fulu      -- declare the lineage once, in Gloas/Fork.lean
 
 inherit Validator         -- a container EIP-7732 leaves unchanged
 inherit processRandao     -- a transition step it leaves unchanged
+inherit Root Gwei         -- and the vocabulary the steps are written in
+inherit Const.slotsPerEpoch
 ```
 
+That last pair is the point of the model. A fork's body code names its own
+namespace and the framework, and nothing else: its type aliases, its constants,
+and its `Preset` / `Config` classes are all its own, so a Gloas function
+constrains `[Gloas.Preset]` and never mentions Fulu. Two files per fork name
+their parent, the fork-upgrade boundary and the pyspec runner, and one more holds
+the lineage edge.
+
 **Validated against the real vectors.** The full in-scope suite passes at both
-the `minimal` and `mainnet` presets, for both forks, pinned to release
-`v1.7.0-alpha.10`. The verdict model is honest. An out-of-range read or a crash
+the `minimal` and `mainnet` presets, for all three forks (Fulu, Gloas, Heze),
+pinned to release `v1.7.0-alpha.11`. The error model is honest. An out-of-range read or a crash
 is a hard failure, and an unimplemented branch is a visible `xfail`. Every
 passing vector reflects a real match or a faithful rejection.
 
@@ -92,12 +108,55 @@ lake build EthCLLib EthCLSpecs       # build the framework and the fork bodies
 just ethcl-test                       # build everything plus the Lean self-tests
 
 # Pyspec against upstream vectors (downloads and caches the archive):
-just ethcl-pyspec-smoke          # dev subset, both forks
+just ethcl-pyspec-smoke          # dev subset, all three forks
 just ethcl-pyspec "--subset=0 --fork=gloas"   # one fork, full in-scope suite
-just ethcl-pyspec-full                # the full sweep: both presets, both forks
+just ethcl-pyspec-full                # the full sweep: both presets, all three forks
 ```
 
 CI runs the dev-subset smoke gate. The full multi-preset sweep runs on demand.
+
+## Verification status
+
+Both tables are generated from the built `.olean`s by
+`just proof-coverage-update`. `just proof-coverage-check` fails the build when
+they drift from the proofs, in either direction.
+
+A **spec function** is a constant a `forkdef` declared. *Touched* means a theorem
+statement under `EthCLSpecs.Proofs` mentions the function. *Characterized* means
+a `@[characterizes …]` tag claims the theorem states the function's main
+contract, a claim the attribute validates where the proof is written. A fork's
+denominator is its effective surface: the spec functions its own source declares
+plus every ancestor `forkdef` it re-elaborated through `inherit`. The *Authored*
+column is the fork's own diff, for scale.
+
+<!-- proof-coverage:begin -->
+| Fork | Characterized | Touched | Spec functions | Authored |
+| --- | --- | --- | --- | --- |
+| `EthCLSpecs.Fulu` | 0 | 2 | 158 | 158 |
+| `EthCLSpecs.Gloas` | 8 | 21 | 209 | 109 |
+| `EthCLSpecs.Heze` | 0 | 6 | 218 | 12 |
+| **Total** | 8 | 29 | 585 | 279 |
+
+| Axiom | Theorems resting on it |
+| --- | --- |
+| `propext` | 47 |
+| `Classical.choice` | 42 |
+| `Quot.sound` | 46 |
+| `Lean.ofReduceBool` | 0 |
+| `Lean.trustCompiler` | 0 |
+| `SizzLean.Hasher.sha256Hash_eq_spec` | 0 |
+| `SizzLean.Hasher.sha256Combine_eq_spec` | 0 |
+| `<theorem>._native.bv_decide.ax_* (bv_decide certificate)` | 3 |
+<!-- proof-coverage:end -->
+
+The axiom table is the whole trust base of these proofs. Any axiom outside it
+fails the run, `sorryAx` above all. `EthCLLib` carries no coverage number: it is
+elaborators and an effect monad, and its correctness claim is that the replayed
+forks build and pass conformance.
+
+[`docs/PROOF_LEDGER.md`](docs/PROOF_LEDGER.md) is the forward half. The tables
+above record what is proved; the ledger records what we intend to prove next, one
+row per candidate spec function, and `just proof-coverage` cross-checks the two.
 
 ## Documentation
 

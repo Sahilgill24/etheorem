@@ -30,6 +30,39 @@ namespace EthCLLib.Tests.FrameworkUtils
 #guard le8 (uint64ToBytes 258) = 258
 #guard le8 (uintToBytes (258 : UInt64)) = 258
 
+/-! ## Checked `uint64` arithmetic: the faithful over/underflow faults
+
+`checkedAdd` / `checkedSub` / `checkedMul` mirror remerkleable's `uint64`, which raises on
+over/underflow rather than wrapping. In range they reduce to `.ok`; out of range they raise the
+uncaught `.arithmetic` fault (never an expected rejection). The same source fault rides in as
+`.arithmetic` on the state machine and, via `[ErrorConv …]`, as `.transition (.arithmetic …)` on
+the store machine, so both instantiations are pinned. Faults are unreachable on well-formed
+vectors, so these guards are the only thing exercising the throw. -/
+#guard (checkedAdd 2 3 "x" : Except StateTransitionError UInt64).toOption = some 5
+#guard (checkedSub 5 3 "x" : Except StateTransitionError UInt64).toOption = some 2
+#guard (checkedMul 6 7 "x" : Except StateTransitionError UInt64).toOption = some 42
+#guard (checkedSub 3 5 "u" : Except StateTransitionError UInt64) matches .error (.arithmetic _)
+#guard (checkedAdd 0xffffffffffffffff 1 "o" : Except StateTransitionError UInt64) matches .error (.arithmetic _)
+#guard (checkedMul 0x8000000000000000 4 "o" : Except StateTransitionError UInt64) matches .error (.arithmetic _)
+#guard (checkedSub 3 5 "u" : Except StoreTransitionError UInt64) matches .error (.transition (.arithmetic _))
+
+/-! ## Fuel exhaustion: a deferral, never an expected rejection
+
+`fuelIterateM!` throws when its bound runs out. That bound is a modeling artifact rather than
+spec text, so the reject is `todo` (a work-queue `xfail`) and stays outside the caught set a
+runner scores as a `valid: false` step's expected rejection. Pinned on the constructor: a
+regression to `.assert` would turn a wrong loop bound into a green step, and breaks the build
+here instead. -/
+private def fuelOut : Except StoreTransitionError Nat :=
+  fuelIterateM! 0 (0 : Nat) "pin" fun n => pure (.next (n + 1))
+
+#guard fuelOut matches .error (.todo _)
+#guard (match fuelOut with | .error e => !e.isExpectedRejection | .ok _ => false)
+-- A walk inside its bound still returns normally: fuel 3 reaches the `.done` at 2.
+#guard (fuelIterateM! 3 (0 : Nat) "pin" (fun n =>
+  pure (if n ≥ 2 then .done n else .next (n + 1))) : Except StoreTransitionError Nat).toOption
+    = some 2
+
 /-! ## Map-backing equivalence: `treeMap` and `hashMap` agree -/
 
 private def pairs : List (Nat × Nat) := [(3, 30), (1, 10), (2, 20), (1, 11), (5, 50)]
@@ -62,5 +95,25 @@ example : (@computeDomain fastHasherTag ⟨#[0,0,0,1]⟩ v0 r0).toArray.size = 3
 -- A depth-0 Merkle branch holds iff the leaf is the root (no siblings to mix).
 example : @isValidMerkleBranch fastHasherTag r0 #[] 0 0 r0 = true := by native_decide
 example : @isValidMerkleBranch fastHasherTag r0 #[] 0 0 (Vector.replicate 32 1) = false := by native_decide
+
+-- The length guard (`depth != len(branch)`) rejects on either mismatch, before
+-- the walk hashes anything. The second case is the one a defaulting read would
+-- get wrong: at depth 0 the walk never touches the extra sibling, so it would
+-- reconstruct `r0` and accept.
+example : @isValidMerkleBranch fastHasherTag r0 #[] 1 0 r0 = false := by native_decide
+example : @isValidMerkleBranch fastHasherTag r0 #[r0] 0 0 r0 = false := by native_decide
+
+-- `computeMerkleBranchRoot` reports an out-of-range sibling read as an
+-- `IndexError` carrying the real index and bound. The walk reads levels 0 and 1
+-- from the two siblings, then asks for level 2 against a size-2 array. Only a
+-- direct caller reaches this arm; `isValidMerkleBranch`'s guard runs first.
+--
+-- The result is projected to a `Nat` pair because `Except IndexError (Vector
+-- UInt8 32)` carries no `DecidableEq` instance, so the equation cannot be
+-- stated on the `Except` value itself.
+example :
+    (match @computeMerkleBranchRoot fastHasherTag r0 #[r0, r0] 3 0 with
+     | .error (.indexError idx bound) => some (idx, bound)
+     | .ok _ => none) = some (2, 2) := by native_decide
 
 end EthCLLib.Tests.FrameworkUtils

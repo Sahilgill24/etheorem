@@ -77,8 +77,9 @@ wraps both behind the `[CryptoBackend]` seam.
 **The vectors and the spec source.** Conformance runs against the upstream
 `consensus-spec-tests`, downloaded per `pyspecPinnedVersion`. The
 `PINNED_VERSION` in `packages/EthCLSpecs/PySpecTests/harness.py` pins
-`v1.7.0-alpha.10`; the implementation bumps
-to the current latest release at start and confirms the tag carries Gloas vectors.
+`v1.7.0-alpha.11`; the implementation bumps
+to the current latest release at start and confirms the tag carries vectors for the
+newest ported fork (Heze at this writing).
 The archive layout is `tests/<preset>/<fork>/<runner>/<handler>/<suite>/<case>/`; the
 preset and fork live in the path, and each case carries a `meta.yaml`
 (`bls_setting`, `blocks_count`, the `transition` format's `fork_epoch`). The spec
@@ -128,7 +129,7 @@ reference them rather than re-deriving them.
 | Dependency | Why | Gates |
 |---|---|---|
 | The SizzLean preset-resolved symbolic-cap derive blocks `forkcontainer` | a container is `[Preset]`-parameterized and its field widths are `Const.*` projections that stay symbolic until the preset resolves; `SSZRepr` has to derive over those caps and reduce once `[Preset]` is concrete | the container front-end (Phase 1) |
-| The three spikes gate building on the mechanisms they confirm | the fork-inheritance replay, the `[CryptoBackend]` instance, and vector acquisition plus SSZ decode are load-bearing pieces chosen but not yet exercised; a wrong assumption found after the framework is built is expensive to unwind | `forkdef` / `forkcontainer` / `inherit`, every crypto-gated step, and the whole harness input edge (Phase 1 onward) |
+| The three spikes gate building on the mechanisms they confirm | the fork-inheritance replay, the `[CryptoBackend]` instance, and vector acquisition plus SSZ decode are essential pieces chosen but not yet exercised; a wrong assumption found after the framework is built is expensive to unwind | `forkdef` / `forkcontainer` / `inherit`, every crypto-gated step, and the whole harness input edge (Phase 1 onward) |
 | The walking skeleton must be green before Fulu broadens | one green format end-to-end through the per-worker Lean server proves the framework, the harness, the crypto seam, and the inheritance on the smallest surface; broadening onto unproven plumbing multiplies debugging cost | the full Fulu port (Phase 2) |
 | Mainnet performance is smoke-tested once the core transition is green | "both presets from day one" is true at the type level; performance is not, mainnet states are far larger and exercise the cache and FFI hasher on bigger trees | the mainnet hardening (Phase 4) |
 
@@ -246,7 +247,7 @@ works.
 
 ### 1.1 The framework skeleton (`EthCLLib`)
 
-**Goal.** Stand up the framework's load-bearing core: the parts every later step and
+**Goal.** Stand up the framework's core: the parts every later step and
 container depend on, and nothing more.
 
 **Deliverables.**
@@ -328,7 +329,8 @@ disk to a green result.
   case-tree walk, `meta.yaml` parsing, and a `pytest-xdist` runner where each worker
   holds one server through a `session`-scoped fixture.
 - The classify-bucket reporting: passing, expected rejection, out-of-scope `todo`,
-  likely-bug (`outOfBounds` / `missingKey`).
+  likely-bug (`outOfBounds` / `decodeFailure`), uncaught fault (`missingKey` /
+  `arithmetic`).
 
 **Acceptance.** One format, the single-operation handler the slice implements, is
 green end-to-end at the minimal preset, driven through a per-worker Lean server.
@@ -374,14 +376,14 @@ has every primitive it calls.
   `[CryptoBackend]` class with the caching FFI backend (keyed by the full serialized
   input per primitive), the symbolic backend, the `bls_setting: 2` verify-off mode,
   and the batch KZG cell verifier.
-- The control-flow combinators: the `Step` done/next type with `fuelLoop` (monadic) and
-  `fuelIterate` (the pure walk for linear DAG descents), with the per-loop decision rule
+- The control-flow combinators: the `Step` done/next type with `fuelLoop`, and
+  `fuelIterateM` / `fuelIterateM!` for linear walks, with the per-loop decision rule
   documented.
 - The finite-map and fork-choice store: `MapKind`, the `FcMap` operation class
   (`insert`, `lookup`, `contains`, `fold`, `keys`), the `treeMap` and `hashMap`
   instances, and the `Store` over `forkstruct`.
 - The full `PySpecTests` driver set: the step/check interpreter for `fork_choice`
-  alongside the fold-compare-root and single-step drivers; the `runStateTransition`
+  alongside the fold-compare-root and single-step drivers; the `runNestedStateTransition`
   nested-machine bridge.
 - The forms' edge cases: an inherited container whose field type or capacity cap
   names an overridden symbol, the preamble-in-scope behavior, and legible
@@ -445,7 +447,7 @@ layer, and the handlers.
 
 **Deliverables.** The fork choice (`Store` accessors, `Weight`, `Head`, `Handlers`),
 with the read layer pure and the `on_*` handlers monadic, `onBlock` running the state
-transition through `runStateTransition`, and the recursive walks given their
+transition through `runNestedStateTransition`, and the recursive walks given their
 per-loop termination strategy.
 
 **Acceptance.** `fork_choice` is green at minimal, exercising the step/check

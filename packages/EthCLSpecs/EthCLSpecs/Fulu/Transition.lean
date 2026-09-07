@@ -26,7 +26,7 @@ namespace EthCLSpecs.Fulu
 state_section
 
 /-- The all-zero `Root` (an empty `state_root` sentinel in `latest_block_header`). -/
-def zeroRoot : Root := Vector.replicate 32 0
+forkdef zeroRoot : Root := Vector.replicate 32 0
 
 /-! ### Slot processing -/
 
@@ -141,7 +141,8 @@ forkdef processSyncAggregate (agg : SyncAggregate) : StateTransition Unit := do
   let participantKeys : Array BLSPubkey :=
     (Bitvector.trueIndices bits).map (fun i => syncCommittee.pubkeys[i]!)
   let previousSlot := (umax (sszGet state slot) 1) - 1
-  let signingRoot := computeSigningRoot (getBlockRootAtSlot state previousSlot)
+  let previousBlockRoot ← getBlockRootAtSlot state previousSlot
+  let signingRoot := computeSigningRoot previousBlockRoot
     (getDomain state Const.domainSyncCommittee (computeEpochAtSlot previousSlot))
   assert (blsEthFastAggregateVerify participantKeys signingRoot agg.syncCommitteeSignature)
 
@@ -182,7 +183,10 @@ forkdef processExecutionPayload (body : BeaconBlockBody) : StateTransition Unit 
   let epoch := currentEpochOf state
   let mix := vmodGet (sszGet state randaoMixes) epoch Const.epochsPerHistoricalVector
   assert (payload.prevRandao == mix)
-  assert (payload.timestamp == (sszGet state genesisTime) + (sszGet state slot) * Const.secondsPerSlot)
+  -- `compute_time_at_slot(state, state.slot)` (`Fulu/Time.lean`). It can fault, so it arrives
+  -- through `liftErr`, which lands the `.arithmetic` fault on this machine unwrapped.
+  let expectedTimestamp ← liftErr (computeTimeAtSlot state (sszGet state slot))
+  assert (payload.timestamp == expectedTimestamp)
 
   let header : ExecutionPayloadHeader :=
     { parentHash := payload.parentHash, feeRecipient := payload.feeRecipient,

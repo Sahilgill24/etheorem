@@ -44,19 +44,6 @@ the `xfail` work-queue. Polymorphic in the result, like `todo`. -/
     (what : String) : m α :=
   throw (SpecReject.outOfScope what)
 
-/-- Run the nested state machine from a store action: execute `act` (the
-specialised `state_transition` / `process_slots` as an `EStateM StateTransitionError
-S` action) on `pre`, returning the post-state, or re-throwing the inner failure
-wrapped as `StoreTransitionError.transition` (`FRAMEWORK_ARCHITECTURE.md` §6, §7.2).
-The store handler binds the result in its own monad `m`. This is the one-way bridge:
-the store machine runs the state machine, never the reverse. -/
-@[inline] def runStateTransition {S : Type} {m : Type → Type u} [Monad m]
-    [MonadExceptOf StoreTransitionError m] (pre : S)
-    (act : EStateM StateTransitionError S Unit) : m S :=
-  match act.run pre with
-  | .ok _ post => pure post
-  | .error e _ => throw (ErrorConv.conv e : StoreTransitionError)
-
 /-- Collapse a reprinted condition to a single tab-free line. `reprint` keeps the
 trailing trivia after `cond` (whitespace and any following comment), which would
 embed newlines / the next line's text in the descriptor and break the

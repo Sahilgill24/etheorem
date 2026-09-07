@@ -32,6 +32,19 @@ Vector UInt8 32`, …) can use `hashMap`. -/
 instance instHashableVector {α : Type} {n : Nat} [Hashable α] : Hashable (Vector α n) :=
   ⟨fun v => hash v.toArray⟩
 
+/-- Lexicographic `Ord` on a fixed-length byte vector, so a `Root`- or
+`Checkpoint`-keyed map satisfies `MapKind`'s `[Ord K]`. It sits here beside
+`instHashableVector` for the same reason: `Vector UInt8 n` is a SizzLean type
+naming no spec concept, so no fork owns it. -/
+instance instOrdVectorUInt8 {n : Nat} : Ord (Vector UInt8 n) where
+  compare a b := Id.run do
+    for i in [0:n] do
+      let x := a.toArray[i]!
+      let y := b.toArray[i]!
+      if x < y then return .lt
+      if x > y then return .gt
+    return .eq
+
 /-- The kind of a finite-map *family*: `key type → value type → concrete map`,
 given the key carries the union of structure both stock maps need. -/
 abbrev MapKind := (K : Type) → [Ord K] → [BEq K] → [Hashable K] → Type → Type
@@ -104,13 +117,25 @@ def FcMap.getOrThrowKey {map : MapKind} [FcMap map] {K V : Type} [Ord K] [BEq K]
   | some v => pure v
   | none   => throw (StoreTransitionError.missingKey errKey)
 
-/-- `getOrThrowKey` for a `Root`-keyed map: a miss reports the lookup key itself. The
-`Vector UInt8 32` instances are taken as binders so this resolves wherever a `Root`-keyed
-store map is read (the `Ord` instance lives with the spec's fork-choice store). -/
+/-- `getOrThrowKey` for a `Root`-keyed map: a miss reports the lookup key itself.
+The `Vector UInt8 32` structure it needs is all global here (`instOrdVectorUInt8`,
+`instHashableVector`, `Vector`'s own `BEq`), so nothing rides in as a binder. -/
 @[inline] def FcMap.getOrThrow {map : MapKind} [FcMap map] {V : Type}
-    [Ord (Vector UInt8 32)] [BEq (Vector UInt8 32)] [Hashable (Vector UInt8 32)]
     {m : Type → Type} [Monad m] [MonadExceptOf StoreTransitionError m]
     (mp : map (Vector UInt8 32) V) (k : Vector UInt8 32) : m V :=
   FcMap.getOrThrowKey mp k k
+
+/-- Look up `k`, or throw the spec's `assert` reject. The fused form of the pyspec pair
+`assert k in d` followed by `d[k]`: the membership assert is the spec's own opening line, so
+a miss is an *expected rejection* (`.assert`), where `getOrThrow`'s bare-`d[k]` miss is
+`missingKey` (a bug-smell). Post-assert the key is present, so binding the value at the
+assert site is observably identical to the spec's later read. `descr` renders the asserted
+condition, diagnostic only. -/
+def FcMap.getOrAssert {map : MapKind} [FcMap map] {K V : Type} [Ord K] [BEq K] [Hashable K]
+    {m : Type → Type} [Monad m] [MonadExceptOf StoreTransitionError m]
+    (mp : map K V) (k : K) (descr : String) : m V :=
+  match FcMap.lookup mp k with
+  | some v => pure v
+  | none   => throw (StoreTransitionError.assert descr)
 
 end EthCLLib.Spec

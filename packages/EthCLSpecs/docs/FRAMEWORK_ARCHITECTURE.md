@@ -13,7 +13,7 @@ author's side.
 A consensus spec sits at a small intersection. A reader fluent in the Python
 `pyspec` may not have written a Lean macro; a reader fluent in Lean may not know
 what a hash-tree-root is. This document teaches both sides as it goes. Where a
-Lean idiom is load-bearing, it gets a sentence the first time it appears; where
+Lean idiom carries the meaning, it gets a sentence the first time it appears; where
 a spec term needs grounding, it gets one too.
 
 The framework owns the plumbing. It owns the arithmetic, the SSZ machinery, the
@@ -43,7 +43,7 @@ instance-implicit class, and a consumer, the test runner, a proof, or a future
 production client, picks the concrete instance at the call boundary. The spec
 body commits to none of them.
 
-Six seams carry the design.
+These seams carry the design.
 
 | Seam | Class / variable | What it abstracts | Fast instance | Pure instance |
 |---|---|---|---|---|
@@ -51,12 +51,15 @@ Six seams carry the design.
 | Config values | `[Config]` | config-tier values (fork versions, genesis delay) | the test config | a fixed config |
 | Merkleization hasher | `[HasherTag]` | the SSZ hash backend, carried as `HasherTag.H` | `Sha256` (FFI, opaque) | `Sha256Spec` (pure-Lean) |
 | Crypto backend | `[CryptoBackend]` | BLS verify/aggregate, KZG | caching FFI | symbolic (abstract `verify`) |
+| Execution engine | `[ExecutionEngine Payload Tx Requests]` | the `execution_engine.*` methods (`is_inclusion_list_satisfied`, `verify_and_notify_new_payload`) | optimistic global instance | a local refuting/real instance |
+| Data availability | `[DataAvailability]` | `is_data_available` from Gloas on, whose sidecar retrieval the spec leaves implementation-defined | optimistic global instance | a local refuting/real instance |
 | Finite-map backing | `{map : MapKind} [FcMap map]` | the fork-choice store's maps | `hashMap` | `treeMap` |
 | Box flavour | smart constructor at the anchor | cache strategy of the boxed state | `FastBox` (cached, `= CachedBox Sha256`) | `UncachedBox Sha256Spec` (uncached) |
 | Effect monad | `{StateTransition : Type → Type}` | the state-threading effect | `EStateM` | `StateT ∘ Except` |
 
-Five of these hide completely behind instance resolution or a constructor choice
-at the anchor, so the author never names them. The fork-choice map is the one
+Most of these hide completely behind instance resolution or a constructor choice
+at the anchor, so the author never names them. The execution engine's two columns
+read as a trust axis instead of a speed one. The fork-choice map is the one
 exception, and it cannot hide: `map` lands in the `Store` type itself, so
 `Store hashMap` and `Store treeMap` are genuinely distinct types. A fork-choice
 section takes `map` as an explicit type variable for that reason. The finite-map
@@ -159,7 +162,7 @@ Because the inheritance replays the author's own syntax, the sibling names are
 un-stamped and bind at the child site, so no blanket hygiene override is needed.
 `SPEC_AUTHORING_MODEL.md` registers this as *the inheritance mechanism*.
 
-### 3.1 One capture base, three forms
+### 3.1 One capture base, several forms
 
 The same capture powers every kind of declaration, so capture is the shared base
 and each form layers its own generation on top.
@@ -167,20 +170,51 @@ and each form layers its own generation on top.
 | Form | Captures | Generates on top | For |
 |---|---|---|---|
 | `forkdef` | the raw body syntax | nothing beyond a `def` | steps and helpers |
+| `forkabbrev` | the raw body syntax | an `abbrev` rather than a `def` | type aliases, `Const` entries |
+| `forkinstance` | the raw signature and value | a named `instance` | registrations whose subject is a fork name (`ValidModulus`) |
 | `forkcontainer` | the raw field list | the SSZ instances (the container front-end) | SSZ containers |
 | `forkstruct` | the raw field list | ordinary `deriving` only | non-SSZ structures (`Store`, `FcNode`, `LatestMessage`) |
 
-All three are producers into one syntax store, keyed by fork and name. `inherit`
-is the single consumer. The shared `fork` prefix marks the common behavior: every
-form is captured for per-fork replay. Late binding is needed for all three. An
-inherited container field whose type names an overridden container, or whose
-capacity names an overridden constant, must resolve to the child fork's version,
-and re-elaboration in the child namespace delivers that.
+All are producers into one syntax store, keyed by fork and name. `inherit` is the
+single consumer, and it takes several names per line so related entries group
+without losing the one-line-per-name discipline. The shared `fork` prefix marks
+the common behavior: every form is captured for per-fork replay. Late binding is
+needed for all of them. An inherited container field whose type names an
+overridden container, or whose capacity names an overridden constant, must
+resolve to the child fork's version, and re-elaboration in the child namespace
+delivers that.
+
+`forkabbrev` and `forkinstance` earn their places by what replay would otherwise
+lose. Replaying a `forkabbrev` as a `def` would drop `@[reducible]`, and
+reducibility is what lets SSZRepr synthesis see through `Root` to
+`Vector UInt8 32` and lets a symbolic list cap reduce to a literal once a
+concrete `Preset` is injected. A `forkinstance` cannot ride on `forkdef` at all,
+since the capturing forms drop `declModifiers` on replay and an `@[instance]`
+attribute would go with them. `forkinstance` requires a name, unlike Lean's
+`instance`, because the capture key *is* a name and `inherit` has nothing else to
+spell.
+
+#### Capture keys are fork-scoped
+
+A capture is keyed by `(fork, name)`, where the pair comes from splitting the
+elaboration-time namespace at the nearest registered fork. A `forkabbrev` written
+inside `namespace EthCLSpecs.Fulu` … `namespace Const` files as
+`(EthCLSpecs.Fulu, Const.slotsPerEpoch)`, so `inherit Const.slotsPerEpoch` in the
+child resolves it. Keying on the raw current namespace would file the constant
+under `EthCLSpecs.Fulu.Const`, which is no fork at all, and no lineage walk would
+reach it.
+
+The composite name carries through to the replay: Lean places
+`def Const.foo` written inside `namespace Gloas` at `Gloas.Const.foo` *and*
+elaborates its body as if inside `Gloas.Const`, so a dotted key gets exactly the
+late binding a bare one does. `EthCLLib/Tests/ForkScoping.lean` pins that, along
+with section-variable auto-binding through a replay's `elabCommand` and
+abbrev-ness surviving replay.
 
 ### 3.2 The parent declaration
 
-A fork names its parent once, with a `fork` declaration in the fork's root
-module.
+A fork names its parent once, with a `fork` declaration in the fork's
+`Fork.lean` (load-order row 0).
 
 ```lean
 fork Fulu            -- the base, no parent
@@ -189,9 +223,17 @@ fork Gloas from Fulu -- Gloas inherits from Fulu
 
 The `fork … from …` declaration records the lineage edge in an environment
 extension. It is data the resolver reads, not a generator. The bare `fork`
-keyword declares the fork; `forkdef` / `forkcontainer` / `forkstruct` declare its
-members. The lineage generalizes to deeper chains (`X from Y from Z`); the
-current build has one hop, since Fulu is whole and Gloas is its diff.
+keyword declares the fork; the capturing forms declare its members. The lineage
+generalizes to deeper chains, and the current build is `Fulu ← Gloas ← Heze`.
+
+Two placement rules follow from how the data travels. The child's `Fork.lean`
+also carries the **feeder import** of the parent's library root, because
+environment extensions travel only through `.olean` imports and there would
+otherwise be nothing to replay. And the file has to be the *first* module of the
+fork's intra-fork import chain, because `inherit` and every capturing form read
+`lineageExt` while they elaborate; the fork's library root cannot hold it, being
+an aggregator that elaborates last. Every other module of the fork imports
+intra-fork only.
 
 ### 3.3 The two forms over three fates
 
@@ -202,9 +244,8 @@ two *forms*. A declaration is **inherited** (unchanged from the parent),
 
 `inherit Foo` covers the inherit fate. It resolves by walking the lineage from the
 `fork … from …` data: this fork did not capture `Foo`, so the resolver steps to
-the parent and replays the parent's captured `Foo` in the child namespace. A full
-declaration (`forkdef`, `forkcontainer`, or `forkstruct`) covers the override and
-new fates. The two are identical in form. Whether a parent symbol of that name
+the parent and replays the parent's captured `Foo` in the child namespace. Any
+capturing form covers the override and new fates. The two are identical in form. Whether a parent symbol of that name
 existed is the only thing that tells them apart, and the author does not mark
 which; the resolver knows from the lineage.
 
@@ -231,8 +272,8 @@ pipeline can `inherit` it.
 
 Containers and structures follow the same two cases as functions. An unchanged one
 is `inherit`ed; a changed or new one is declared in full. There is no field-merge
-form, no append form, and no macro-level `extends`. SSZ field order is
-load-bearing for serialization and Merkleization, so a fork that changes a
+form, no append form, and no macro-level `extends`. SSZ field order decides
+the serialization and the Merkleization, so a fork that changes a
 container restates its complete field list. The order stays explicit on the page
 and checked by conformance, rather than computed from a parent by some merge rule
 the reader cannot see. A full declaration regenerates the SSZ instances over its
@@ -240,8 +281,10 @@ field list.
 
 Two consequences the author should expect. The replayed declaration resolves
 against whatever is in scope at the `inherit` site, so the author owns the
-preamble: the section header, any `open` or notation, and the constants the body
-uses must be in scope in the child before `inherit`. The framework does not
+preamble: the section header, any notation, and the constants the body uses must
+be in scope in the child before `inherit`. In scope means *this fork's own*: the
+child inherits the vocabulary too, so the constants the body reaches are the
+child's `Const` entries, never the parent's. The framework does not
 reconstruct the preamble; a missing one fails to elaborate with a plain
 unknown-identifier error, which is the legible-errors discipline at work.
 Inheritance is by symbol, so a property proved about a caller is proved per fork:
@@ -270,7 +313,7 @@ nothing to unify against. That is why the tiers are classes.
 | Universal | none | no | `Const.farFutureEpoch : Epoch := 2^64 - 1` | nothing |
 | Config | `class Config` | no | `Const.genesisForkVersion := Config.genesisForkVersion` | `[Config]` |
 
-Each tier is an `abbrev` whose body is a class projection (for the two class
+Each tier is a `forkabbrev` whose body is a class projection (for the two class
 tiers) or a literal (for the universal tier). A preset abbrev carries `[Preset]`;
 the universal abbrev carries no binder and reads identically at the call site; the
 config abbrev carries `[Config]`. The mechanism that makes each abbrev carry only
@@ -284,13 +327,84 @@ namespace Const
 section
 variable [Preset] [Config]
 
-abbrev slotsPerEpoch : Nat := Preset.slotsPerEpoch          -- carries [Preset]
-abbrev farFutureEpoch : Epoch := 2 ^ 64 - 1                 -- carries nothing
-abbrev genesisForkVersion : Version := Config.genesisForkVersion  -- carries [Config]
+forkabbrev slotsPerEpoch : Nat := Preset.slotsPerEpoch          -- carries [Preset]
+forkabbrev farFutureEpoch : Epoch := 2 ^ 64 - 1                 -- carries nothing
+forkabbrev genesisForkVersion : Version := Config.genesisForkVersion  -- carries [Config]
 
 end
 end Const
 ```
+
+The auto-binding survives replay: a child's `inherit Const.slotsPerEpoch` block
+sits inside its own `section variable [Preset] [Config]`, and the replayed body
+picks the binder up by the same used-variable rule, now bound to the *child's*
+classes.
+
+### 4.1 The tiers are per fork
+
+Each fork owns its own `Preset` and `Config`, declared with `forkpreset` /
+`forkconfig` and their value sets with `forkpresetvalues` / `forkconfigvalues`.
+A Gloas function constrains `[Gloas.Preset]` and never mentions Fulu.
+
+These four forms capture like the rest, and compose differently. A class is a
+single declaration, so per-name `inherit` cannot fuse two of them; instead the
+child's own form collects the ancestors' captured blocks along the lineage,
+merges them by entry name (child-most-wins, ancestor order preserved), and emits
+one **flat** class in the child's namespace. The capture records only the child's
+diff, so a grandchild composes transitively. `inherit` rejects a tier capture
+outright, with a message pointing at the right form.
+
+A fork that adds no field of its own still writes the form (`forkconfig` with no
+`where` clause), because the class it emits has to be that fork's own.
+
+Proof fields ride along like any other field, and a proof-field assignment
+(`slotsPerEpochPos := by decide`) re-proves in the child against the child's
+number, so an overridden value gets a fresh proof with nothing restated.
+
+Which values belong on `Preset` is decided by the upstream file, not by whether
+the two presets currently agree: everything under `presets/{minimal,mainnet}/*.yaml`
+is a `Preset` field even where both files say the same number today. A preset
+value that shapes a type would otherwise be baked in as a literal, and a future
+divergence would silently produce a wrong cap and a wrong Merkle root rather than
+a build error. `Config` follows `configs/{minimal,mainnet}.yaml` the same way.
+Values under the spec's `## Constants` heading stay flat.
+
+### 4.2 The downgrade bridge
+
+Per-fork classes create two unrelated instance families, and the fork-upgrade
+boundary sits between them. `upgradeToGloas` copies a
+`Vector Root Fulu.Const.slotsPerHistoricalRoot` field into a
+`Vector Root Gloas.Const.slotsPerHistoricalRoot` field *symbolically*, before any
+concrete preset is injected, and for unrelated classes those cap types are not
+defeq, so the upgrade would not elaborate.
+
+So a child's `forkpreset` also emits
+
+```lean
+namespace Downgrade
+@[reducible] scoped instance toFuluPreset [Preset] : Fulu.Preset := { … }
+end Downgrade
+```
+
+projecting every parent field out of the child's class, generated field by field
+from the parent's merged field list. The fork author never writes the parent's
+name; the form reads it from the lineage.
+
+The upgrade then runs under a single `[Gloas.Preset]` binder: the Fulu side's
+instance is a reducible structure literal, so
+`Fulu.Preset.slotsPerHistoricalRoot toFuluPreset` reduces by iota to the Gloas
+field and cap-type defeq holds with the preset still symbolic. The runner gets
+the same bridge, injecting only `Gloas.minimal` and reaching the Fulu spine by
+projection; the bridges chain, so `Heze.minimal` reaches either ancestor.
+`EthCLLib/Tests/TierMerge.lean` pins the symbolic defeq on a synthetic two-fork
+chain.
+
+The `Downgrade` sub-namespace is what contains the bridge. `scoped` alone would
+not: a fork's body files all sit *inside* the fork's namespace, where a scoped
+instance is already active. One namespace deeper, only a file that writes
+`open scoped Downgrade` can satisfy a parent-class constraint, so the two
+boundary files declare the reach in one line each and everything else stays
+sealed.
 
 Because the preset tier shapes types, a container's field widths read as
 `Const.*` and reduce to literals when the preset instance is concrete. A field
@@ -414,14 +528,15 @@ keeping with the project's stringly-typed-is-a-smell principle. The two exceptio
 are `assert`'s `descr` (rendered from the asserted expression's syntax) and
 `todo`'s `what`. Both are diagnostic strings, printed only on a vector mismatch and
 never branched on, since the vectors record valid-or-invalid and never a reason.
-The error *constructor* is what is load-bearing, and the pyspec harness reads
+The error *constructor* is what counts, and the pyspec harness reads
 it in its classify mode:
 
 | Constructor | Classify-mode meaning |
 |---|---|
 | `assert` | an expected rejection; a vector marked invalid should hit one |
 | `todo` | an unimplemented branch; flagged out-of-scope, not counted as a rejection |
-| `outOfBounds` / `missingKey` | a smell; the spec should not hit these on well-formed input, so they surface as likely bugs |
+| `outOfBounds` / `decodeFailure` | a smell; the spec should not hit these on well-formed input, so they surface as likely bugs |
+| `missingKey` / `arithmetic` | a fault the reference propagates rather than catches, so it never counts as a rejection |
 
 ### 6.1 `todo` as the deferral work-queue
 
@@ -528,6 +643,12 @@ fork_choice_section map
 --   variable [Monad StoreTransition]
 --   variable [MonadStateOf (Store map) StoreTransition]
 --   variable [MonadExceptOf StoreTransitionError StoreTransition]
+--   variable {StateTransition : Type → Type}                        -- the nested machine
+--   variable [NestedStateMachine StoreTransition State StateTransition]
+--   variable [MonadRunState State StateTransition]
+--   variable [Monad StateTransition]
+--   variable [MonadStateOf State StateTransition]
+--   variable [MonadExceptOf StateTransitionError StateTransition]
 ```
 
 The fork-choice map cannot hide the way the hasher and the box flavour do, because
@@ -538,6 +659,15 @@ three raw constraints, `[Monad m]`, `[MonadStateOf (Store map) m]`, and
 `[MonadExceptOf StoreTransitionError m]`, with no `StoreM` bundle, for the same
 reasons the state side has none.
 
+The last six lines are the nested state machine a handler may run through
+`runNestedStateTransition` (§7.2). `StateTransition` is an `outParam` of `NestedStateMachine`,
+so the instance picks it and the binder exists only to give the section a name for what
+was picked; `MonadRunState` is how the bridge runs it, and the three raw constraints after
+that are the same ones `state_section` emits. All four resolve once the name is fixed,
+which is why the `NestedStateMachine` line comes first. Lean includes a `variable` only in
+declarations that mention it, so a handler that never crosses the bridge, `on_tick` and
+`on_attester_slashing` among them, carries none of the six.
+
 ### 7.2 Discharge and the nested-machine bridge
 
 Discharge is a consumer concern. The `.run` of the monad stays out of the spec
@@ -546,15 +676,60 @@ discharge it. The runner pins `[Preset]`, `[HasherTag]`, and the concrete monad 
 the entry point, and the inner steps share the section's instances.
 
 The fork choice runs a full state transition inside the `onBlock` handler. The
-`runStateTransition` bridge runs the inner `StateTransition` machine from a
+`runNestedStateTransition` bridge runs the inner `StateTransition` machine from a
 `StoreTransition` handler and maps any inner failure to
 `StoreTransitionError.transition`, the wrapper constructor from the error model.
+
+Running a state machine from outside it takes two things, and they are two classes,
+because the consumers that need the first outnumber the ones that need the second.
+
+**How to run one.** A state machine's monad is a `variable` in every spec body, and the
+three constraints `state_section` emits give no way to get a value back out of it:
+`Monad` gives `pure` and `bind`, `MonadStateOf` gives `get` and `set`, `MonadExceptOf`
+gives `throw` and `tryCatch`. `MonadRunState` (`Spec/RunState.lean`) is that missing
+capability and nothing else.
+
+```lean
+class MonadRunState (S : outParam Type) (M : Type → Type) where
+  runFrom : {α : Type} → S → M α → Except StateTransitionError (α × S)
+```
+
+Nothing about it is fork-choice-specific. `runToRoot`, which every `PySpecTests`
+state-transition entry point ends with, is generic over it too, with no store in sight;
+the entry point's ascription on its action picks the column and `runToRoot` stays out of
+it.
+
+**Which one to run.** That question only arises inside the store machine, where the
+handler names no monad at all, and it is `NestedStateMachine`.
+
+```lean
+class NestedStateMachine (m : Type → Type) (S : Type) (M : outParam (Type → Type))
+```
+
+No fields; it is a type-level choice keyed on `m`, the way `MonadLift` is keyed on its
+source monad. `M` being an `outParam` is what keeps it invisible to spec bodies: a store
+handler calling another store handler leaves the callee's `M` as a metavariable, and were
+`M` an input there would be one solution per instance, so resolution would be ambiguous.
+Determined by `(m, S)`, it resolves from the section's instance at every call site.
+
+Two instances ship, one per column. A store machine at `EStateM` runs its state machine
+at `EStateM`; a store machine at `StateT`/`Except` runs it at `StateT`/`Except`. So the
+runner keeps a two-layer inner monad rather than a stack built over the store's, and a
+fork-choice proof gets `StateT State (Except StateTransitionError)`, the same monad the
+state-machine theorems in `EthCLSpecs/Proofs/` already pin.
+
+What the bridge preserves is proved with it, once for every action.
+`runNestedStateTransition_of_ok` turns a step's `(step).run pre = .ok ((), post)` into the
+store-machine statement `runNestedStateTransition pre step = pure post`, with `_of_error`
+and the two `eval` siblings covering the rest. Carrying a state-machine theorem into a
+fork-choice proof is then function application, which is what the two `example`s at the
+end of `Proofs/Gloas/ForkChoiceRun.lean` show.
 
 ```lean
 def onBlock (signedBlock : SignedBeaconBlock) : StoreTransition Unit := do
   let pre ← getPreState signedBlock.message.parentRoot   -- a boxed State from the Store
-  let post ← runStateTransition pre (stateTransition signedBlock)
-  -- runStateTransition discharges the inner machine and maps
+  let post ← runNestedStateTransition pre (stateTransition signedBlock)
+  -- runNestedStateTransition discharges the inner machine and maps
   -- StateTransitionError → StoreTransitionError.transition
   storePostState signedBlock post
 ```
@@ -614,7 +789,7 @@ The access primitives are SizzLean's generic macros, used directly.
 | `sszModify state field[i]! := g` / `… as x => body` | `state.field[i] = g(state.field[i])` | read-modify-write of one path, named once; `:= g` applies a function, `as x => body` binds the current value (`fun`-free, for `{ x with … }`); sugar over `sszUpdate … := … (sszGet …)` |
 | `modifyState fun state => …` | several `state.field = …` lines | updates several fields of the threaded state at once |
 | `getStateRoot` | `hash_tree_root(state)` | the Merkle root of the threaded state, keeping the cache-warmed box (`stateRoot` returns the root with the box for a non-monadic context, `stateRoot!` discards it, terminal-only) |
-| `sszGetIdx (sszGet state F) i` / `xs[i]!` | `xs[i]` | element read; a load-bearing (data-derived) index uses `sszGetIdx`, surfacing `outOfBounds idx bound`, never a crash; a statically-bounded or `assert`-guarded index uses the total `xs[i]!` |
+| `sszGetIdx (sszGet state F) i` / `xs[i]!` | `xs[i]` | element read; a data-derived index uses `sszGetIdx`, surfacing `outOfBounds idx bound`, never a crash; a statically-bounded or `assert`-guarded index uses the total `xs[i]!` |
 
 ```lean
 def incrementSlot : StateTransition Unit := do
@@ -625,7 +800,7 @@ def checkSlot (expected : Slot) : StateTransition Unit := do
   assert (sszGet state slot == expected)
 ```
 
-Indexed access carries a deliberate split. A field projection stays pure. A load-bearing
+Indexed access carries a deliberate split. A field projection stays pure. A data-derived
 index, one a data field supplies with no structural bound, reads through `sszGetIdx` (or
 `bitlistGetIdx` for a `Bitlist`) and returns through the error channel, surfacing
 `outOfBounds idx bound` rather than a panic, with a single `liftErr` adapter joining the two
@@ -793,7 +968,7 @@ The crypto primitives are instance-implicit (`[CryptoBackend]`), even though one
 real algorithm is used, because the seam buys two things.
 
 **Caching.** The pyspec suite calls BLS `verify` repeatedly on recurring
-inputs: shared validator sets, domains, and fixtures recur across the sweep, and the
+inputs: shared validator sets, domains, and fixtures recur across the suite, and the
 runner holds one long-lived server per worker so the memo stays warm. The runner
 injects a backend that memoizes `verify` over the real FFI, keyed on the full
 `(pubkey, message, signature)` wire bytes, a small fixed-size key whose hash costs far
@@ -857,22 +1032,25 @@ shapes result, and only the last needs machinery.
 
 For the hard-measure case, where the bound is a runtime value (store size) and a
 decreasing measure is less obvious up front, the framework provides a `Step` done/next
-type and two structural-recursion-on-`Nat` primitives over it, both total and
-kernel-reducible: `fuelLoop` (monadic, for a walk that reads the store through the
-effect monad) and `fuelIterate` (pure, for a walk that is a plain function of the store).
-The author writes the step body returning `.done` / `.next` and passes the bound (a store
-or block count, a safe over-estimate); no `Nat` counter and no exhaustion branch in the
-body. `fuelIterate` returns the accumulator itself when the fuel runs out, matching a
-hand-rolled `| 0, a => a` walk, so the bound must exceed the walk length (exhaustion is
-then unreachable and the result is always real).
+type and structural-recursion-on-`Nat` primitives over it, all total and
+kernel-reducible: `fuelLoop` for a walk that reads the store through the effect monad,
+and `fuelIterateM` / `fuelIterateM!` for a linear iteration. The author writes the step
+body returning `.done` / `.next` and passes the bound (a store or block count, a safe
+over-estimate); no `Nat` counter and no exhaustion branch in the body. `fuelLoop` and
+`fuelIterateM` take an `exhausted` value and return it when the fuel runs out, so the
+bound must exceed the walk length; `fuelIterateM!` throws there instead, for the bounds
+that rest on an arithmetic identity rather than a structural count.
 
 ```lean
-def getAncestor (store : Store map) (root : Root) (slot : Slot) : Root :=
-  fuelIterate ((FcMap.keys store.blocks).length + 1) root fun r =>
-    match FcMap.lookup store.blocks r with
-    | some block => if block.slot > slot then .next block.parentRoot else .done r
-    | none       => .done r
+forkdef getAncestor (store : Store map) (root : Root) (slot : Slot) : StoreTransition Root :=
+  fuelLoop ((FcMap.keys store.blocks).length + 1) root root fun r => do
+    let block ← FcMap.getOrThrow store.blocks r
+    if block.slot > slot then pure (.next block.parentRoot)
+    else pure (.done r)
 ```
+
+The map read is `getOrThrow`, not a `lookup` with a default: `store.blocks[r]` is a plain
+`Dict` subscript in the spec, so a missing root has to reject.
 
 These suit the *linear* fork-choice walks (a single `.next` continuation): `getAncestor`
 and the `getHead` descent. A *tree* walk like `filterBlockTree`, which recurses over every
@@ -982,8 +1160,9 @@ and the pytest fixture managing the subprocess.
 
 The report distinguishes the classify buckets from the error model: a passing
 case, an expected rejection (`assert` against an invalid vector), an out-of-scope
-deferral (`todo`), and a likely bug (`outOfBounds` / `missingKey` on well-formed
-input). A `todo` that a vector actually reaches fails loudly rather than passing
+deferral (`todo`), a likely bug (`outOfBounds` / `decodeFailure` on well-formed
+input), and an uncaught fault (`missingKey` / `arithmetic`, which the reference
+propagates). A `todo` that a vector actually reaches fails loudly rather than passing
 silently, which is the deferral safety net at work.
 
 ---
@@ -1071,7 +1250,7 @@ Seven anti-patterns the framework avoids in every definition, in order of severi
    equivalence axioms are only the concrete-bytes fallback. A spec function that
    itself calls some other extern-opaque primitive would force compiler axioms into
    every proof above it.
-5. **A load-bearing `arr[i]!` in a monadic step.** A data-derived index (a validator /
+5. **A data-derived `arr[i]!` in a monadic step.** A data-derived index (a validator /
    committee / queue index an operation supplies) with no structural bound reads through
    `sszGetIdx`, surfacing `outOfBounds idx bound` (§7), so a bad index lands in the
    `likelyBug` bucket and a proof need not unfold through the `Inhabited` default. Total
