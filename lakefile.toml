@@ -47,10 +47,11 @@ name = "LeanHazmatKzg"
 path = "packages/LeanHazmatKzg"
 
 # XMSS one-time signatures (xmss-reference, vendored). Needs `just hazmat-xmss-vendor`
-# before `lake build`. Self-contained: no OpenSSL dep, bundled SHA-256.
+# before `lake build`. Links OpenSSL libcrypto (xmss-reference's hash.c calls
+# SHA256()); see packages/LeanHazmatXmss/lakefile.lean.
 [[require]]
-name = "LeanHazmatXMSS"
-path = "packages/LeanHazmatXMSS"
+name = "LeanHazmatXmss"
+path = "packages/LeanHazmatXmss"
 
 # (The LeanHazmatConsensus aggregator over the three families is deferred —
 # YAGNI until a consumer needs a whole crypto layer in one require; see
