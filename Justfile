@@ -15,6 +15,11 @@
 # `PYTEST_JOBS=2 just ethcl-pyspec-full`.
 pytest_jobs := env_var_or_default("PYTEST_JOBS", "auto")
 
+# The vector `just ethcl-profile` profiles when the caller names none: the Gloas
+# mainnet `sanity/blocks` case the OPTIMISATION.md Stage 17d row table was
+# measured on. Any extracted vector directory holding a `pre.ssz_snappy` works.
+default_profile_case := env_var("HOME") + "/.cache/sizzlean/v1.7.0-alpha.11-mainnet/tests/mainnet/gloas/sanity/blocks/pyspec_tests/full_random_operations_0"
+
 # List every recipe with its description
 default:
     @just --list --unsorted
@@ -25,14 +30,15 @@ default:
 
 # Compile every library: the SSZ chain (LeanSha256 → SizzLean → EthCLLib →
 # EthCLSpecs), the LeanHazmat FFI crypto families, and the standalone
-# LeanPoseidon island. The vendored families (LeanHazmatBls, LeanHazmatKzg) need
-# their `hazmat-*-vendor` recipes first; the dependencies run them (idempotent)
-# before building. `lake build EthCLSpecs` pulls in EthCLLib + SizzLean
-# transitively.
+# LeanPoseidon island. The vendored families (LeanHazmatSha256's ISA-L on
+# x86_64 Linux, LeanHazmatBls, LeanHazmatKzg, LeanHazmatXmss) need their
+# `hazmat-*-vendor` recipes first; the dependencies run them (idempotent)
+# before building.
+# `lake build EthCLSpecs` pulls in EthCLLib + SizzLean transitively.
 
 # Build all packages
 [group('general')]
-build: hazmat-bls-vendor hazmat-kzg-vendor hazmat-xmss-vendor
+build: hazmat-sha256-vendor hazmat-bls-vendor hazmat-kzg-vendor hazmat-xmss-vendor
     lake build LeanSha256
     lake build LeanHazmatSha256
     lake build LeanHazmatBls
@@ -189,21 +195,33 @@ doctor-native:
       miss "libcrypto         (OpenSSL 3.x development headers + shared library)"
     fi
 
+    # x86_64 Linux only: LeanHazmatSha256 builds the vendored ISA-L
+    # `sha256_mb` unit (the multi-buffer SHA-256 lanes are nasm
+    # assembly). Every other host takes the OpenSSL loop and needs no
+    # assembler.
+    if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+      if command -v nasm >/dev/null 2>&1; then
+        info "nasm              ($(nasm -v 2>&1 | head -1))"
+      else
+        miss "nasm              (assembles the vendored ISA-L SHA-256 multi-buffer lanes; x86_64 Linux only)"
+      fi
+    fi
+
     if [ "$fail" -ne 0 ]; then
       echo
       echo "Some required build-time deps are missing. Install hints:"
       case "$(uname -s)" in
         Linux)
           if [ -r /etc/os-release ] && grep -qE '^ID(_LIKE)?=.*(debian|ubuntu)' /etc/os-release; then
-            echo "  Debian / Ubuntu : sudo apt install libssl-dev pkg-config"
+            echo "  Debian / Ubuntu : sudo apt install libssl-dev pkg-config nasm"
           elif [ -r /etc/os-release ] && grep -qE '^ID(_LIKE)?=.*(fedora|rhel|centos)' /etc/os-release; then
-            echo "  Fedora / RHEL   : sudo dnf install openssl-devel pkgconf-pkg-config"
+            echo "  Fedora / RHEL   : sudo dnf install openssl-devel pkgconf-pkg-config nasm"
           elif [ -r /etc/os-release ] && grep -qE '^ID(_LIKE)?=.*arch' /etc/os-release; then
-            echo "  Arch            : sudo pacman -S openssl pkgconf"
+            echo "  Arch            : sudo pacman -S openssl pkgconf nasm"
           elif [ -r /etc/os-release ] && grep -qE '^ID(_LIKE)?=.*alpine' /etc/os-release; then
-            echo "  Alpine          : sudo apk add openssl-dev pkgconf"
+            echo "  Alpine          : sudo apk add openssl-dev pkgconf nasm"
           else
-            echo "  Linux           : install OpenSSL 3.x development headers + pkg-config"
+            echo "  Linux           : install OpenSSL 3.x development headers + pkg-config (+ nasm on x86_64)"
           fi
           ;;
         Darwin)
@@ -347,6 +365,30 @@ ethcl-pyspec-full: _ensure-venv
     cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=mainnet --fork=gloas
     cd packages/EthCLSpecs/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=0 -n {{ pytest_jobs }} --preset=mainnet --fork=heze
 
+# The Stage 17d container profile: which consensus container types dominate
+# encode / decode / root cost on a real mainnet state transition. Runs the
+# `specs_profile` exe over one upstream vector, at the mainnet preset, and
+# writes a TSV in the same column shape `just sizzlean-bench` emits, so
+# `just sizzlean-bench-diff` compares a profile pair directly.
+#
+# `case` is a vector directory under the harness cache
+# (`~/.cache/sizzlean/<tag>-mainnet/tests/mainnet/<fork>/...`); the default is
+# the Gloas `sanity/blocks` case the OPTIMISATION.md row table was measured on.
+# The archive must already be extracted: run any `ethcl-pyspec` recipe once
+# first, which downloads it.
+
+# Profile the consensus container types over one pyspec vector; TSV → packages/SizzLean/bench/specs-profile-<timestamp>.tsv
+[group('ethcl')]
+ethcl-profile case=default_profile_case: _ensure-venv
+    @mkdir -p packages/SizzLean/bench
+    @ts=$(date -u +%Y%m%dT%H%M%SZ); \
+      tmp=$(mktemp -d); \
+      paths=$({{ justfile_directory() }}/.venv/bin/python scripts/prepare_profile_vector.py "{{ case }}" "$tmp"); \
+      lake build specs_profile && \
+      packages/EthCLSpecs/.lake/build/bin/specs_profile $paths \
+        | tee "packages/SizzLean/bench/specs-profile-$ts.tsv"; \
+      rm -rf "$tmp"
+
 # ═════════════════════════════════════════════════════════════════════════
 # SizzLean — SSZ library
 #
@@ -391,7 +433,8 @@ sizzlean-pyspec-smoke: _ensure-venv
     cd packages/SizzLean/PySpecTests && {{ justfile_directory() }}/.venv/bin/python -m pytest -q --subset=2
 
 # Full sweep: every in-scope wire-format vector (the out-of-scope progressive
-# forms xfail). 2188 passed / 292 xfailed at the pin.
+# forms xfail). 2215 passed / 294 xfailed at the pin (`v1.7.0-alpha.13`, frozen; see
+# `packages/SizzLean/PySpecTests/harness.py`).
 
 # Full ssz_generic pyspec sweep: every in-scope wire-format vector
 [group('sizzlean')]
@@ -416,6 +459,34 @@ sizzlean-bench:
       lake build ssz_bench && \
       packages/SizzLean/.lake/build/bin/ssz_bench \
         | tee "packages/SizzLean/bench/$ts.tsv"
+
+# Stage 17c heap bench: N resident states, hash-consing off vs on. Reports
+# distinct tree cells (deterministic, allocator-independent) per config.
+
+# Build + run the multi-state hash-consing heap bench; TSV → packages/SizzLean/bench/multistate-<timestamp>.tsv
+[group('sizzlean')]
+sizzlean-bench-multistate:
+    @mkdir -p packages/SizzLean/bench
+    @ts=$(date -u +%Y%m%dT%H%M%SZ); \
+      lake build ssz_multistate && \
+      packages/SizzLean/.lake/build/bin/ssz_multistate \
+        | tee "packages/SizzLean/bench/multistate-$ts.tsv"
+
+# The comparative benchmark against `ethereum/ssz-specs` and
+# `lambdaclass/libssz`. The driver does the whole job: it builds SizzLean's
+# harness, downloads and compiles both comparables at pinned revisions, emits
+# the shared 2.9 MB `BeaconState`, runs the three harnesses, checks that they
+# agree on every root, and writes the markdown report. It needs `cargo` and a
+# Python 3.11 or later interpreter besides `lake`; `scripts/compbench/README.md`
+# states the method. Each harness runs each scenario 100 times and the report
+# gives the mean, which takes about four minutes. Extra arguments pass
+# through, so `just sizzlean-comp-benchmark "--reps 20"` shortens the run and
+# `--skip-build` re-measures without rebuilding.
+
+# Comparative benchmark vs ssz-specs + libssz; markdown → packages/SizzLean/bench/comparative-<timestamp>.md
+[group('sizzlean')]
+sizzlean-comp-benchmark *args:
+    python3 scripts/comparative_benchmark.py {{ args }}
 
 # Aligned column output for readability; falls back to plain diff if
 # `column` is unavailable.
@@ -459,9 +530,32 @@ leansha256-bump-patch:
 # lives here.
 # ═════════════════════════════════════════════════════════════════════════
 
-# Full NIST CAVP byte-oriented SHA-256 vectors against the OpenSSL FFI shim (LeanHazmatSha256) — 129 cases + the combine/batch anchor KAT, all via native_decide
+# ISA-L crypto pin: tag v2.26.1. Only its `sha256_mb` unit is built (the
+# multi-buffer SHA-256 engine behind `sha256BatchCombine` on x86_64 Linux;
+# every other host keeps the OpenSSL loop and never reads this tree). The
+# lakefile drives ISA-L's own `Makefile.unx`, which needs `nasm` on PATH
+# (`just doctor-native` checks).
+
+isal_tag := "v2.26.1"
+
+# Vendor ISA-L crypto (multi-buffer SHA-256) for LeanHazmatSha256 — shallow clone at the pinned tag
 [group('hazmat')]
-hazmat-sha256-test:
+hazmat-sha256-vendor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="packages/LeanHazmatSha256/vendor/isa-l_crypto"
+    if [ -d "$dir/.git" ]; then
+      echo "isa-l_crypto already vendored at $dir ($(git -C "$dir" describe --tags 2>/dev/null || echo unknown))"
+      exit 0
+    fi
+    rm -rf "$dir"
+    mkdir -p "$(dirname "$dir")"
+    git clone --depth 1 --branch "{{ isal_tag }}" https://github.com/intel/isa-l_crypto "$dir"
+    echo "vendored isa-l_crypto {{ isal_tag }} -> $dir"
+
+# Full NIST CAVP byte-oriented SHA-256 vectors against the FFI shim (LeanHazmatSha256) — 129 cases + the combine/batch anchor KAT, all via native_decide. Needs `just hazmat-sha256-vendor` on x86_64 Linux (run via the dependency).
+[group('hazmat')]
+hazmat-sha256-test: hazmat-sha256-vendor
     lake build LeanHazmatSha256Tests
 
 # Re-generate the NIST CAVP vector table (OpenSSL FFI shim) from `packages/LeanHazmatSha256/cavp/*.rsp`. Stdlib-only Python; no .venv needed.

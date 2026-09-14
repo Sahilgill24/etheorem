@@ -240,24 +240,29 @@ build expects:
 
 - **Linux (Debian/Ubuntu, including CI):** `libssl-dev` for the headers
   (`/usr/include/openssl/evp.h`) and the versioned `libcrypto.so.3`
-  shared library, plus `pkg-config`. Install via:
+  shared library, plus `pkg-config`. On x86_64 also `nasm`, which
+  assembles the vendored ISA-L multi-buffer SHA-256 lanes behind
+  `sha256BatchCombine`. Install via:
 
   ```bash
-  sudo apt-get install libssl-dev pkg-config
+  sudo apt-get install libssl-dev pkg-config nasm
   ```
 
 - **macOS:** `openssl@3` + `pkg-config` via Homebrew (the `pkg-config`
-  discovery handles the keg-only include/lib paths).
+  discovery handles the keg-only include/lib paths). No assembler: the
+  batched combine takes the OpenSSL loop there.
 
 Run `just doctor-native` to verify the build-time native deps
-(`cc`, `git`, `pkg-config`, OpenSSL 3.x).
+(`cc`, `git`, `pkg-config`, OpenSSL 3.x, and `nasm` on x86_64 Linux).
 
-**Vendored crypto (the LeanHazmat BLS / KZG families).** `LeanHazmatBls`
-(blst) and `LeanHazmatKzg` (c-kzg-4844) wrap *vendored* native libraries,
-fetched at pinned tags by `just hazmat-bls-vendor` / `just hazmat-kzg-vendor` into
-gitignored `vendor/` trees before `lake build` (never git submodules; see
+**Vendored crypto (the LeanHazmat families).** `LeanHazmatSha256`
+(ISA-L crypto, x86_64 Linux only), `LeanHazmatBls` (blst) and
+`LeanHazmatKzg` (c-kzg-4844) wrap *vendored* native libraries, fetched
+at pinned tags by `just hazmat-sha256-vendor` / `just hazmat-bls-vendor`
+/ `just hazmat-kzg-vendor` into gitignored `vendor/` trees before
+`lake build` (never git submodules; see
 [`hazmat-docs/ARCHITECTURE.md`](hazmat-docs/ARCHITECTURE.md) §6). `just
-build` runs both vendor steps for you. The C / C++ compilers are invoked
+build` runs the vendor steps for you. The C / C++ compilers are invoked
 through the Lean toolchain's `cc` wrapper, no separate configuration
 required.
 
@@ -291,10 +296,16 @@ just sizzlean-pyspec-full    # every in-scope wire-format vector
 ### Coverage
 
 Pinned at consensus-spec-tests
-[v1.7.0-alpha.11](https://github.com/ethereum/consensus-spec-tests/releases/tag/v1.7.0-alpha.11).
+[v1.7.0-alpha.11](https://github.com/ethereum/consensus-spec-tests/releases/tag/v1.7.0-alpha.11),
+except `ssz_generic`, which is frozen at
+[v1.7.0-alpha.13](https://github.com/ethereum/consensus-spec-tests/releases/tag/v1.7.0-alpha.13).
+That is the last release carrying those vectors: consensus-specs removed the SSZ
+specification and the `ssz_generic` tests in `v1.7.0-alpha.14`, and the
+specification now lives in [`ethereum/ssz-specs`](https://github.com/ethereum/ssz-specs),
+which ships its own JSON vector archive per release.
 
-- **`ssz_generic`** (SizzLean): 2188 in-scope cases pass across every handler
-  (uints, basic_vector, bitvector, bitlist, boolean, containers). The 292
+- **`ssz_generic`** (SizzLean): 2215 in-scope cases pass across every handler
+  (uints, basic_vector, bitvector, bitlist, boolean, containers). The 294
   EIP-7495 / 7916 / 8016 progressive / stable / compatible cases are out of
   SizzLean's `SSZType` universe and xfail. The test-only container shapes
   (`VarTestStruct`, `ComplexTestStruct`, `BitsStruct`, …) are hard-coded in
@@ -319,7 +330,7 @@ package stands.
 | Package | What a proof covers here | Where it stands |
 | --- | --- | --- |
 | `EthCLSpecs` | the spec functions the fork bodies declare | 8 characterized, 29 touched, of 585 |
-| `SizzLean` | SSZ properties over the whole `SSZType` universe, gated by a predicate | 3 of 5 properties, over 13 admitted arms; open: any `hashTreeRoot` property, cached tree ≡ uncached `hashTreeRoot` |
+| `SizzLean` | SSZ properties over the whole `SSZType` universe, gated by a predicate | 3 of 5 properties, over 15 admitted arms; open: any `hashTreeRoot` property, cached tree ≡ uncached `hashTreeRoot` |
 | `LeanSha256`, `LeanHazmat*` | nothing to cover: `@[extern]` bindings, and a spec side pinned by the NIST CAVP vectors | 3 named equivalence axioms: `sha256Hash_eq_spec`, `sha256Combine_eq_spec`, `sha256BatchCombine_eq_spec` |
 | `LeanPoseidon` | `permute_eq_permuteRef`, in the standalone `LeanPoseidonProofs` package | outside this run: it pins mathlib of its own |
 | `EthCLLib` | out of scope: elaborators and an effect monad | the replay tests and the pyspec vectors are its claim |

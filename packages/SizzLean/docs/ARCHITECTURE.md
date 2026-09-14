@@ -117,30 +117,31 @@ first cut; Phase 3 validated the implementation empirically against
 the pyspec `ethereum/consensus-spec-tests` release vectors;
 Phase 4 built the performance layer on top of the now-known-good
 library; **Phase 5 (Stage 18) widens the three theorems** toward
-universal `Supported` coverage. As of this writing
+complete `BasicSupported` constructor coverage. As of this writing
 `BasicSupported` covers `uintN 8/16/32/64` and `uintN 128/256`
 (the wide arms via the `Nat`-digit codec proof in
 `Proofs/UIntWide.lean`, with no `bv_decide` axiom), `bool`,
-fixed-size `vector` and `list`, `bitvector`, `bitlist` (both via
-the bit-packing inverse in `Proofs/BitPack.lean`), and `container`
-over any field list, whether every field is fixed-size
+`vector` and `list` over fixed-size or variable-size element types,
+`bitvector`, `bitlist` (both via the bit-packing inverse in
+`Proofs/BitPack.lean`), and `container` over any field list,
+whether every field is fixed-size
 (recursively, the `containerFixed` constructor) or the list mixes
 fixed- and variable-size fields (the `containerVar` constructor,
 decoded via the offset-table codec proved in
 `Proofs/ContainerVar.lean` and `Proofs/Roundtrip.lean`'s
-`decode_encode_containerVar_aux`). See `Spec/BasicSupported.lean`
-and the README's *Proof coverage* table. Two gaps remain toward
-universal `Supported` coverage: `vector` / `list` over a
-variable-size element type, and the schema-level
-`maxByteLengthFields fs < MAX_LENGTH` guard on `containerVar`
-(real `BeaconState` / `BeaconBlockBody` shapes sit outside it;
-see etheorem#61 for the value-level relaxation). The
-`SSZ.roundtrip` user-surface corollary is gated by
-`BasicSupported r.shape` until those close too. The asterisk on
+`decode_encode_containerVar_aux`). The `vectorVar` and `listVar`
+proofs live in `Proofs/CollectionVar.lean`. See
+`Spec/BasicSupported.lean` and the README's *Proof coverage*
+table. `Supported` remains a structural codec predicate and admits
+zero-width schemas that the decoder rejects. `BasicSupported`
+carries the proof guards. Value-level offset guards remain tracked
+for `containerVar` (etheorem#61) and `vectorVar` / `listVar`
+(etheorem#77). The `SSZ.roundtrip` user-surface corollary mirrors
+the `BasicSupported r.shape` gate. The asterisk on
 "verified by inheritance" is intentional and small: passing
-empirical conformance is what makes both the performance
-investment in Phase 4 and the research-grade proof investment in
-Phase 5 well-targeted rather than speculative.
+empirical conformance is what points both the Phase 4 performance
+work and the Phase 5 proof work at an implementation already known
+to match the spec.
 
 **What the cache layer adds.** SSZ's `hash_tree_root` is the dominant cost
 in any consensus-state pipeline: a cold root of `BeaconState` hashes tens
@@ -808,16 +809,14 @@ unchanged user surface (`box.hashTreeRoot`, `box.serialize`,
   call, faster underneath. The cross-platform SIMD shim
   (Stage 17b.1) keeps the Lean surface and the trust boundary
   identical across architectures.
-* **Off by default when integrated** (explicit opt-in at
-  `Box` construction): hash-consing (Stage 17c). The standing
-  micro-bench evidence is that the typical workload (one
-  resident state, no inter-tree subtree redundancy) pays a
-  ~9× per-root penalty for consing. The fix is the same shape
-  the user already uses for `H`: pick at construction, then
-  forget. The default `SSZ.FastBox v` remains consing-off; an
-  opt-in constructor variant (e.g. `SSZ.FastBox v
-  (consing := true)`) is what archival / gossip-aggregation
-  callers reach for.
+* **Off by default, opt-in at `Box` construction**:
+  hash-consing (Stage 17c). The typical workload (one resident
+  state, no inter-tree subtree redundancy) gets no hits and pays
+  a lookup per fresh cell. The toggle has the same shape the
+  user already uses for `H`: pick at construction, then forget.
+  `SSZ.FastBox v` is consing-off; `SSZ.FastBox v (consing :=
+  true)` is what archival / gossip-aggregation callers reach for,
+  and the flag follows the box through every `sszUpdate`.
 
 The principle: the user picks `H` and any opt-in optimisations
 once at construction; downstream code uses uniform method names
@@ -1076,7 +1075,7 @@ concrete in the current plan.
 ### 9.2 Phase 2: pure-Lean `Sha256Spec` (deferred)
 
 A pure-Lean SHA-256 reference (compression function + message schedule +
-Merkle-Damgård padding, all in `BitVec 32` arithmetic, the kind of code
+Merkle-Damgård padding, all in `UInt32` arithmetic, the kind of code
 `bv_decide` is built for) becomes worth writing if and when:
 
 - A theorem appears that needs to reduce inside a hash (e.g. proving a
@@ -1098,7 +1097,7 @@ the verification frontier needs it, not before.
 | `Hasher/Sha256.lean`     | `@[extern] opaque sha256Combine` + `instance Hasher Sha256` + Lake C shim. | 1 |
 | `Hasher/Sha256Spec.lean` | Pure-Lean SHA-256 reference; tightens TCB by replacing the FFI assertion with a kernel-checked `@[csimp]`. | 2 (deferred) |
 | `Hasher/Sha256Equiv.lean` | Two axioms naming the empirical FFI ≡ pure-Lean SHA-256 equivalence (`sha256Hash_eq_spec`, `sha256Combine_eq_spec`). Promotes the conformance-validated assertion to an auditable Lean axiom; replaceable by a `@[csimp]`-proved theorem in Phase 4. | 2 |
-| `Hasher/Sha256Batch.lean` | Stage 17b: FFI batched-combine primitive `sha256BatchCombine` for an `Array (ByteArray × ByteArray)` of sibling pairs, plus the third equivalence axiom `sha256BatchCombine_eq_spec`. The C shim ships in `csrc/sha256_batch.c` (scalar EVP loop with shared context); the SIMD path (SHA-NI / AVX-512) plugs into the same FFI surface as a follow-up. | 2 |
+| `Hasher/Sha256Batch.lean` | Stage 17b: FFI batched-combine primitive `sha256BatchCombine` for an `Array (ByteArray × ByteArray)` of sibling pairs, plus the third equivalence axiom `sha256BatchCombine_eq_spec`. The C shim ships in `LeanHazmatSha256/csrc/sha256_batch.c`: Intel ISA-L's multi-buffer engine on x86_64 Linux (Stage 17b.1), the OpenSSL EVP loop with a shared context elsewhere, behind one FFI surface. | 2 |
 
 ### 9.4 Batched-combine plan (Stage 17b.1): Option A, single Sha256 tag
 
@@ -1147,20 +1146,20 @@ Surfacing the ISA choice as a tag would:
 * push hardware-availability decisions to the Lean type level
   when they belong to a runtime CPUID check in the C shim.
 
-The C shim handles dispatch internally: runtime CPUID picks
-SHA-NI / AVX-512 / scalar at startup and stashes the chosen
-function pointer. Lean code stays at `[Hasher Sha256]`; the user
-gets the fastest available implementation transparently. A
-build-time `--scalar-only` flag stays available for environments
-that need to disable runtime SIMD.
+The C shim handles dispatch internally: on x86_64 Linux ISA-L's
+CPUID dispatch picks the AVX-512 / AVX2 / SSE / SHA-NI lanes at run
+time; other hosts compile the OpenSSL loop. Lean code stays at
+`[Hasher Sha256]`; the user gets the fastest available
+implementation transparently.
 
 **Implementation order (do not skip ahead).** The work is layered
 so each step lands a measurable win and the typeclass extension
 doesn't precede a use-case that validates it:
 
-1. **C-side AVX-512 inner loop** in `csrc/sha256_batch.c`. No
-   Lean change. `sha256BatchCombine`'s FFI surface stays
-   identical; any existing caller benefits immediately.
+1. **C-side multi-buffer inner loop** in `csrc/sha256_batch.c`
+   (Stage 17b.1, shipped: ISA-L on x86_64 Linux). No Lean change.
+   `sha256BatchCombine`'s FFI surface stays identical; any
+   existing caller benefits immediately.
 2. **Refactor `merkleRootWithCache` / `commitAndHash` to
    level-order** with `sha256BatchCombine` called directly (no
    typeclass change yet: hardcode `Sha256`'s batched primitive).
@@ -1277,14 +1276,14 @@ graph LR
   `SizzLeanTests/Sha256BatchEquivalence.lean` (7 cases including
   empty / single / 8-pair). Cleared by the same Phase 4 `@[csimp]`
   follow-up as the scalar pair. The C shim is intentionally
-  architecture-aware: the shipped scalar EVP loop is the
-  portability floor (Stage 17b.0); the planned SIMD/hardware-SHA
-  path (Stage 17b.1) dispatches per architecture via a single
-  `#ifdef __x86_64__` block inside `csrc/sha256_batch.c`. On x86_64
-  it links Intel **ISA-L** (BSD-3-Clause; auto-dispatches
-  AVX-512 / AVX2 / SSE via CPUID, covering Intel and AMD); on
-  ARM64 it falls back to OpenSSL, which already uses ARMv8 SHA-Ext
-  on Apple Silicon and Graviton 3+. Importantly, **the Lean-side
+  architecture-aware: the OpenSSL EVP loop is the portability
+  floor (Stage 17b.0); the multi-buffer path (Stage 17b.1) is
+  selected per build host by `LeanHazmatSha256/lakefile.lean` and
+  reaches `csrc/sha256_batch.c` as one define. On x86_64 Linux it
+  compiles in vendored Intel **ISA-L** (BSD-3-Clause; auto-dispatches
+  AVX-512 / AVX2 / SSE / SHA-NI lanes via CPUID, covering Intel and
+  AMD); every other host keeps OpenSSL, which already uses ARMv8
+  SHA-Ext on Apple Silicon and Graviton 3+. Importantly, **the Lean-side
   surface is unchanged across architectures**: the
   `sha256BatchCombine` signature, the
   `sha256BatchCombine_eq_spec` axiom, and the
@@ -1500,7 +1499,7 @@ plans as to the document itself.
 | **2: User surface** | Layer 3 (`SSZRepr` + deriving handler) and the Day-1 `FFI/Sha256` `@[extern] opaque` instance. | FFI/Sha256 has no dependency on the verification frontier. SHA-256 is opaque from Day 1; its NIST-conformance assertion is in the TCB. The `SSZ.roundtrip` user-surface corollary is gated by `BasicSupported r.shape` until Stage 18 widens it. The cached Merkle-tree work (Layer 4) has moved to Phase 4. |
 | **3: Application + empirical validation** | Layer 5 (Eth types) + `SizzLeanTests/Sha256Vectors` (consumes `ethereum/consensus-spec-tests` release vectors). | Conformance runs against the verified spec functions (`SSZ.hashTreeRoot` from Layer 1, uncached). This is the empirical safety net for both the verified and asserted-equivalent paths, and the gating signal for both Phase 4 (performance) and Phase 5 (proofs): passing here is what makes either investment well-targeted. |
 | **4: Production primitives + deferred hardening** | Layer 4 (`Tree`, `TreeBacked`, the cached Merkle layer); pure-Lean `Hasher/Sha256Spec.lean` + `@[csimp]` (removes the FFI assertion from TCB); performance work (`ViewDU`-style deferred-update overlay, batched SHA-256, hash-consing). | All stages independent and order-agnostic among themselves. The cache layer lands here (not Phase 2) because it's a *performance* layer asserted equivalent to the spec; deferring it past empirical validation means its property tests have a known-good reference oracle (the spec, validated in Phase 3). The Approach C `profile%` macro is not on the plan; see §8 for the rationale (no fork through Gloas uses EIP-7495 / EIP-7916 / EIP-8016 forms). |
-| **5: Complete formal verification** | **Stage 18: widen `BasicSupported` toward `SSZType.Supported` / `SupportedBounded`, closing `decode_encode`, `serialize_injective`, `encode_size_le_max` arm by arm.** Currently closed: `uintN 8/16/32/64/128/256`, `bool`, fixed-size `vector` and `list`, `bitvector`, `bitlist`, and `container` over any field list (fixed-only, recursively, or mixed fixed/variable via the offset-table codec, subject to `maxByteLengthFields fs < MAX_LENGTH`). Open: `vector` / `list` over a variable-size element type, and the value-level relaxation of the `containerVar` size guard (etheorem#61). | Positioned last by design: empirical conformance from Phase 3 ensures the proof effort targets a known-correct implementation, not a speculative one. The publishable non-malleability artefact lands when the remaining arms close. |
+| **5: Complete formal verification** | **Stage 18: close `decode_encode`, `serialize_injective`, and `encode_size_le_max` for each `BasicSupported` constructor.** All current constructors are closed: `uintN 8/16/32/64/128/256`, `bool`, fixed-element and variable-element `vector` / `list`, `bitvector`, `bitlist`, and fixed-field or mixed-field `container`. Value-level offset-guard widening remains for `containerVar` (etheorem#61) and `vectorVar` / `listVar` (etheorem#77). | Positioned last by design: empirical conformance from Phase 3 gives the proofs a known-correct implementation. The publishable non-malleability result states its `BasicSupported` scope and trust footprint directly. |
 
 The single highest-risk implementation item is gindex arithmetic in
 `Node.setAt`. Mitigation: structural recursion on an explicit `List Bool`

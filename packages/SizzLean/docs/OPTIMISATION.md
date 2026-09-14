@@ -385,10 +385,10 @@ Five sub-stages with a microbenchmark in
 |---|---|---|
 | 17a | Pending overlay (closure-based, read-from-view at commit) | **shipped** |
 | 17b.0 | Batched FFI primitive `sha256BatchCombine` + named axiom | **shipped** |
-| 17b.1 | AVX-512 / SHA-NI inner loop in the C shim | **not done** (FFI surface ready; swap is C-side only) |
-| 17b.2 | Rank-frontier Lean walker that batches `sha256BatchCombine` by readiness rank | **not done** (depends on 17b.1 to be worth wiring) |
-| 17c | Hash-consing primitive (`Node.mkPair`) | **library primitive shipped; not on default cached path** |
-| 17d | `@[specialize]` on the three SSZ surfaces | **shipped** |
+| 17b.1 | Multi-buffer inner loop in the C shim (ISA-L on x86_64 Linux) | **shipped** |
+| 17b.2 | Rank-frontier Lean walker that batches `sha256BatchCombine` by readiness rank | **not done** |
+| 17c | Hash-consing on the cached path, opt-in at `Box` construction | **shipped; default off** |
+| 17d | `@[specialize]` on the three SSZ surfaces | **shipped (pass 1)**; per-type hints profiled and declined (pass 2) |
 | 17e | Fused commit walk (`Node.commitAndHash`) + pre-cached `Node.ofShape` builders | **shipped** |
 
 The measured-need gate that originally fronted Stage 17 has been
@@ -396,8 +396,8 @@ crossed in two directions: the benches now show *which* of the
 shipped optimisations deliver real wins (17a + 17e together are
 the headline cache-vs-pure ratio on realistic workloads, see
 S6/S7 in the bench) and *which* ship infrastructure pending a
-follow-up to light up (17b.1 / 17b.2, needs the SIMD inner loop
-and the rank-frontier walker). Each section below records both the
+follow-up to light up (17b.0 + 17b.1, the batched primitive and
+its multi-buffer shim, wait on the 17b.2 rank-frontier walker). Each section below records both the
 design and the measured result; the per-sub-stage details
 remain accurate as implementation references. They document what
 the optimisation does, the data structure it needs, the prior
@@ -428,10 +428,12 @@ because there's only one root read. The SHA-256 work itself is
 the dominant cost, the same in both paths.
 
 `@[specialize]` (17d) fires in both columns (compile-time, can't
-be toggled at runtime). 17b batched SHA-256 and 17c hash-consing
-are *not* exercised by the default cached path. They're opt-in
-through separate APIs (`sha256BatchCombine` / `Node.mkPair`); see
-their dedicated bench files for in-isolation measurements.
+be toggled at runtime). 17b batched SHA-256 is *not* exercised by
+the default cached path; it is opt-in through `sha256BatchCombine`.
+17c hash-consing is on the cached path but off by default;
+`SSZ.FastBox v (consing := true)` turns it on per box, and its
+own bench (`ssz_multistate`) measures the multi-state workload it
+exists for.
 
 The ordering below is the default sequence (highest-impact-
 first per Lighthouse's Milhouse benchmarks and Lodestar's
@@ -655,57 +657,58 @@ the FFI columns measures the FFI's value at hash work. Proofs
 about state-transition functions don't pay this cost because
 they reduce structurally and don't actually compute hashes.
 
-#### Stage 17b.1: Cross-platform SIMD shim: **not done**
+#### Stage 17b.1: Cross-platform SIMD shim: **shipped**
 
-**Goal.** Replace the scalar EVP loop inside
-`csrc/sha256_batch.c` with a per-architecture dispatch that uses
-real SIMD or hardware-SHA where available. Single C shim, one
-library per architecture; the Lean-side surface
-(`sha256BatchCombine`) and the axiom (`sha256BatchCombine_eq_spec`)
-are unchanged.
+**What shipped.** `LeanHazmatSha256/csrc/sha256_batch.c` carries two
+backends behind the one `lean_hazmat_sha256_batch_combine` symbol,
+and `LeanHazmatSha256/lakefile.lean` picks one per build host
+(`useIsal`) and passes the choice to the C file as a single define:
 
-* **x86_64 (Intel + AMD)**: link **Intel ISA-L**
-  (BSD-3-Clause, Intel-maintained, ships in Debian/Ubuntu /
-  RHEL / Alpine as `libisal-crypto-dev`). Its `sha256_mb` API
-  hashes 4 (SSE) / 8 (AVX2) / 16 (AVX-512) buffers in parallel,
-  auto-dispatched via CPUID at runtime. Works identically on
-  AMD CPUs that support the same SIMD ISA (Zen 1+ for AVX2,
-  Zen 4+ for AVX-512).
-* **ARM64 (Apple Silicon, AWS Graviton, ARM servers)**: fall
-  back to **OpenSSL** (already in our link line). OpenSSL's EVP
-  path uses ARMv8 SHA-Ext on supported CPUs (every Apple
-  M-series chip, Graviton 3+, etc.), each single-pair hash is
-  already ~30–50 ns. The "batched" path on ARM is a tight loop
-  over fast single-pair calls; the function-call amortisation
-  is the win, ~1.5×, not the 8–16× of x86 SIMD.
-* **Fallback** (older ARM without SHA-Ext, RISC-V, etc.):
-  OpenSSL EVP loop. Same code path as the ARM64 case.
+* **x86_64 Linux (Intel + AMD)**: Intel **ISA-L crypto** `sha256_mb`
+  (BSD-3-Clause), vendored at a pinned tag by
+  `just hazmat-sha256-vendor` and built through ISA-L's own
+  `Makefile.unx` for the one `sha256_mb` unit (needs `nasm`). Its
+  job manager hashes 4 (SSE) / 8 (AVX2) / 16 (AVX-512) buffers in
+  lock-step, or two streams on SHA-NI parts, auto-dispatched via
+  CPUID at run time. The shim concatenates each pair into a 64-byte
+  lane buffer, submits with `ISAL_HASH_ENTIRE`, drains, and
+  serialises the eight host-order digest words big-endian. The
+  manager's scratch lives per thread, so even one pair goes through
+  ISA-L. The ISA-L objects are folded into the family's single
+  archive, so no dependent package gains a link flag.
+* **Everything else** (ARM64, macOS, other): the OpenSSL EVP loop,
+  two `EVP_DigestUpdate` calls per pair on one shared context. On
+  ARMv8 SHA-Ext CPUs (Apple M-series, Graviton 3+) OpenSSL already
+  uses the hardware instructions, so this is hardware single-stream
+  and the batch amortises the per-call overhead.
 
-```c
-// csrc/sha256_batch.c
-#if defined(__x86_64__) || defined(_M_X64)
-  #include <isa-l_crypto/sha256_mb.h>
-  // ISA-L multi-buffer: submit N pairs, flush, collect digests.
-#else
-  // OpenSSL EVP loop — hardware-SHA on ARMv8 SHA-Ext CPUs.
-#endif
-```
+ISA-L is used because OpenSSL's public EVP API hashes one buffer per
+call and cannot fill SIMD lanes; its internal `sha256_multi_block` is
+private to the TLS stitched ciphers. Distributions do not package
+ISA-L crypto (Debian's `libisal` is the storage library, without
+`sha256_mb`), so it is vendored like blst and c-kzg.
 
-`lakefile.lean` conditionally appends `-lisal_crypto` to
-`moreLinkArgs` when the target triple starts with `x86_64`.
+**Measured** (`sha256BatchCombine`, one call, 32-byte siblings; x86_64
+Linux, SHA-NI + AVX2, no AVX-512; scalar = the OpenSSL loop on the
+same host):
 
-| Architecture | Expected `sha256BatchCombine` (128 pairs) | Speedup over scalar |
-|---|---|---|
-| x86_64 with AVX-512 | ~3 µs | ~13× |
-| x86_64 with AVX2 | ~5 µs | ~8× |
-| x86_64 with SSE4.2 + SHA-NI | ~10 µs | ~4× |
-| ARM64 with ARMv8 SHA-Ext | ~25–30 µs | ~1.5× (amortisation only) |
-| ARM64 / other without hardware SHA | ~40 µs | 1× (no change) |
+| Pairs | OpenSSL loop | ISA-L | Speedup |
+|---|---|---|---|
+| 1 | ~1.7 µs | ~0.6 µs | ~2.7× |
+| 16 | ~6.9 µs | ~4.2 µs | ~1.6× |
+| 128 | ~35 µs | ~13 µs | ~2.8× |
+| 1024 | ~274 µs | ~85 µs | ~3.2× |
+
+Expected on other hosts, not measured: AVX-512 parts fill 16 lanes
+and should sit nearer ~13× on the 128-pair row; ARM64 with SHA-Ext
+keeps the ~1.5× amortisation win of the loop; hosts without hardware
+SHA are unchanged.
 
 **Trust footprint.** No change. The named axiom
-`sha256BatchCombine_eq_spec` still asserts pointwise agreement
-with the pure-Lean reference; the equivalence test re-runs
-identically.
+`sha256BatchCombine_eq_spec` still asserts pointwise agreement with
+the pure-Lean reference, and `Sha256BatchEquivalence` runs the same
+cases against whichever backend the build host compiled in. ISA-L
+sits in the same trust position as the OpenSSL shim.
 
 #### Stage 17b.2: Rank-frontier batched walker: **not done; depends on 17b.1**
 
@@ -792,17 +795,18 @@ path's default walk, or `@[implemented_by]` on
 calls, plus one rebuild, against today's single fused recursion
 in `commitAndHash`. The extra descent and the id-indexed array
 buy full batches on a pure-functional tree. They are dead weight
-until the shim underneath is genuinely parallel, which is why
-this waits on 17b.1.
+until the shim underneath is genuinely parallel, which 17b.1
+delivered on x86_64 Linux.
 
 After this lands, the scenarios bench's `S1`/`S3`/`S4`/`S6`
 ValidatorSet rows should drop on x86 with AVX-512 (approx 3–5×
 faster cached column) and modestly on ARM (~1.5×).
 
-**Dependency on 17b.1.** Without the SIMD shim the rank walker
-delivers zero measurable improvement; the scalar-shim bench
-confirmed it (FFI batched ≈ FFI scalar at ~40 µs / 128 pairs).
-Worth wiring only once 17b.1 ships.
+**Dependency on 17b.1.** The rank walker only pays off over a
+genuinely parallel shim: on the OpenSSL loop, FFI batched ≈ FFI
+scalar at ~40 µs / 128 pairs. With 17b.1 shipped (~13 µs / 128
+pairs on a SHA-NI + AVX2 host, see above), the walker is now the
+open piece.
 
 **Prior art.**
 
@@ -852,54 +856,83 @@ underfilled tail off the SIMD path. 17b.1 owns where that
 threshold sits; 17b.2 owns producing buckets big enough to clear
 it.
 
-### Stage 17c: Hash-consing: **library primitive shipped; not on user interface**
+### Stage 17c: Hash-consing: **shipped; default off, opt-in at `Box` construction**
 
-**Shipped as a library primitive (not wired into the cached
-path).** A global `IO.Ref`-backed bounded-LRU cache
+**What ships.** A global `IO.Ref`-backed bounded cache
 (`SizzLean/Cache/MerkleTree/HashCons.lean`, default capacity
-4096) plus the `Node.mkPair` smart constructor that consults
-the cache. On a cache hit (same 32-byte root previously seen),
-returns the cached `Node` cell; on a miss, allocates fresh and
-inserts. `Node.mkPair` is opt-in. Existing `.pair`
-allocations in `setAt` / `Build.lean` / etc. continue
-unchanged, and `merkleRootWithCache` does **not** call into the
-consing cache. The user-facing `box.hashTreeRoot` therefore sees
-no consing today; this counts as in-flight Stage 17c work.
+4096, wipe-all eviction) keyed by 32-byte root, and a per-box
+toggle: `SSZ.FastBox v (consing := true)` (also on `CachedBox`,
+`CachedSSZ.ofValue`, `TreeBacked.ofValue`, and the two cached
+`deserialize` helpers). `SSZ.FastBox v` stays consing-off. The
+flag is stored on the `TreeBacked` and follows the box through
+every `sszUpdate`.
 
-**Measured result.** On the smart-constructor call:
+**Where the cache is consulted.** The three sites that allocate
+fresh cells on the cached path, and only when the flag is on:
 
-| Path | Time |
-|---|---|
-| `Node.mkPair` cache hit | ~180 ns |
-| `Node.mkPair` cache miss (fresh insert) | ~230 ns |
+* the initial `Node.ofShape` build inside `treeBase`, consed by
+  `Node.consTree` when the thunk is forced;
+* each pending subtree at commit, consed by `Node.consTree`
+  before `commitAndHash` installs it;
+* the spine cells `commitAndHash` allocates, through its own
+  `consing` flag and `Node.consPair`.
 
-The standing micro-bench on the scenarios fixture set (single
-root on `ValidatorSet16`, no inter-tree subtree redundancy)
-showed consing **slowed every root call by ~9×**. The
-cache-lookup overhead per pair is paid on every interior node,
-and the workload offers no hits to amortise it. The win shape
-ChainSafe documents (~30% heap reduction) only materialises on
-multi-tree archival / gossip-aggregation workloads where many
-similar block-states are kept resident.
+`merkleRootWithCache`, `setAt`, `Build.lean`, `Sha256Spec`, the
+uncached flavour, and plain `T` are untouched. With the flag off
+the three sites run exactly as before. The two pure entry points
+are `@[implemented_by]` wrappers over the `BaseIO` primitive; the
+kernel sees the identity and the plain allocation.
 
-**Default-OFF when integrated.** When this is eventually wired
-into the default cached path so the user no longer has to know
-about consing, the **default configuration must keep consing
-off**, with an explicit `Box`-construction opt-in for workloads
-that benefit. Concretely: `SSZ.FastBox v` continues to return a
-consing-off Box; `SSZ.FastBox v (consing := true)` (or a similar
-named-argument toggle on the construction site) is the
-opt-in for archival / gossip-aggregation use. Defaulting it on
-would regress every non-archival scenario by the ~9× factor
-above.
+**The shape rule.** Equal roots do not imply equal shapes: a
+container and the vector of its field roots merkleize to the same
+root (`BeaconBlock` versus `BeaconBlockHeader`), and a same-root
+cell of the wrong shape would swallow later writes at a leaf. A
+hit is accepted only when `Node.shapeEq` holds, leaf against leaf
+and pair against pair at every position, with a pointer
+short-circuit so the check is O(1) once children were consed
+first. `SizzLeanTests/HashConsCoherence.lean` gates both the root
+coherence and the shape rule through `SSZ.FastBox`.
 
-Also deferred: weak-reference semantics. Lean 4 doesn't expose
-a weak-ref API; the bounded-LRU fallback (wipe-all eviction
-when capacity is hit) is what ships. For workloads that justify
-weak refs, the swap is local to `HashCons.lean`.
+**Measured result.** `ssz_multistate` (`just
+sizzlean-bench-multistate`) keeps `N` fresh `ValidatorSet256`
+states resident, each one validator away from a shared base, and
+counts the distinct tree cells the `N` trees reach:
+
+| N | consing off: pairs / leaves | consing on: pairs / leaves | est. bytes off → on |
+|---|---|---|---|
+| 1 | 2303 / 2304 | 2041 / 1787 | 405 KB → 341 KB |
+| 10 | 23030 / 23040 | 2123 / 1794 | 4.05 MB → 350 KB |
+| 50 | 115150 / 115200 | 2445 / 1794 | 20.3 MB → 383 KB |
+| 100 | 230300 / 230400 | 2846 / 1794 | 40.5 MB → 425 KB |
+
+Resident cells grow by about eight pairs per extra state with
+consing on (one validator subtree plus one spine), against 2303
+pairs per state without. The first state pays the cold fill,
+about 2.2× its consing-off build time on the bench host; from
+then on a top-level hit skips the whole subtree below it, and the
+100-state run lands within a few percent of consing off. The
+cache capacity has to fit the workload: the bench raises it to
+2^20 because the default 4096 is smaller than one of these trees.
+
+The cache lives in a global `IO.Ref`, and the runtime marks every
+value stored into such a ref as shared between threads. The map
+is therefore a `Lean.PersistentHashMap`, whose insert path-copies
+in O(log n) whether or not it is shared; a `Std.HashMap` in the
+same position copied its bucket array on every insert and made
+the cold fill quadratic. The consed cells carry the same marking,
+so later touches on them count references atomically.
+
+The scenarios bench (`ssz_bench`) is the guard that the default
+path is unchanged; its rows carry no consing column because a
+single resident state gains nothing from it.
+
+**Deferred.** Weak-reference semantics. Lean 4 has no weak-ref
+API, so the bounded map with wipe-all eviction stays. For
+workloads that justify weak refs, the swap is local to
+`HashCons.lean`.
 
 **Original design notes follow**, the prior-art map and the
-weak-ref design discussion both still apply to the follow-up.
+weak-ref design discussion both still apply.
 
 **What it does.** Dedupe identical populated subtrees globally
 via a weak `HashMap (Hash32) Node`. Complements `ZERO_HASHES`'s
@@ -968,7 +1001,7 @@ currently lacks one. The fallback is a bounded-LRU cache (no
 weak references), which loses the unbounded-archive case but
 keeps the common-case win.
 
-### Stage 17d: Profile-guided `@[specialize]`: **shipped (pass 1)**
+### Stage 17d: Profile-guided `@[specialize]`: **shipped (pass 1); pass 2 measured, no hints kept**
 
 **Shipped.** `@[specialize]` attributes on the three
 deriving-handler-emitted user-facing surfaces in
@@ -991,11 +1024,115 @@ value, which this single-shot bench doesn't exercise. For the
 ValidatorShape's size, the post-`@[specialize]` baseline is
 recorded; future hint changes compare against these columns.
 
-The pass-2 step (site-local `@[specialize T]` annotations on
-specific hot consensus types like `Validator` /
-`BeaconBlockHeader` / per-fork `BeaconState` variants in
-`EthCLSpecs`) is deferred pending workload-specific profiling
-that says it pays.
+**Pass 2: profiled, and no hint earns its place.** The profiling
+the pass-1 note asked for is now done, on a real workload, and it
+says the hints do not pay. The tool is
+`packages/EthCLSpecs/EthCLSpecsBench/`, driven by
+
+```
+just ethcl-profile            # the Gloas mainnet sanity/blocks case
+just ethcl-profile <case-dir> # any extracted vector directory
+```
+
+It decodes an upstream **Gloas mainnet** `sanity/blocks` vector (a
+3.17 MB `BeaconState`, 256 validators) and times each SSZ operation
+per container type. The TSV it writes shares
+`SizzLeanBench.Runner`'s column shape, so
+`just sizzlean-bench-diff` compares two profiles.
+
+**Where the time goes** (median of 20 samples,
+`bench/specs-profile-20260912T041020Z.tsv`; per-type rows cover 1000
+distinct values):
+
+| Row | Median |
+|---|---|
+| `serialize BeaconState` | 3438.9 ms |
+| `ForkInterface.runBlocks` (whole vector) | 363.0 ms |
+| `ForkInterface.stateRoot BeaconState` | 282.8 ms |
+| `FastBox.hashTreeRoot BeaconState` (first root) | 186.6 ms |
+| `htr BeaconState` (pure) | 164.7 ms |
+| `deserialize BeaconState` | 117.8 ms |
+| `htr Attestation ×1000` | 30.3 ms |
+| `deserialize Attestation ×1000` | 11.4 ms |
+| `serialize Attestation ×1000` | 10.7 ms |
+| `htr Validator ×1000` | 7.5 ms |
+| `htr BeaconBlockHeader ×1000` | 7.3 ms |
+| `serialize BeaconBlockHeader ×1000` | 4.5 ms |
+| `serialize Validator ×1000` | 4.2 ms |
+| `deserialize BeaconBlockHeader ×1000` | 4.3 ms |
+| `deserialize Validator ×1000` | 3.8 ms |
+| `htr Checkpoint ×1000` | 2.2 ms |
+
+**How to read these numbers.** Absolute medians track what else the
+machine is doing: a repeat run with one competing CPU-bound process
+moved every row, touched or not, by about 28%. So compare rows *within*
+one run, and compare a change against a paired run taken back to back
+on the same machine. That is how the hint experiment below was
+measured.
+
+**The dispatch a hint would remove costs nothing measurable.** Two
+rows price it directly. `ForkInterface.stateRoot` runs through the
+seam the pyspec driver uses, where the preset arrives as a runtime
+value and every `SSZRepr` instance resolves through a dictionary. The
+`deserialize BeaconState` and `htr BeaconState` rows do the same two
+operations with the preset as a statically known instance:
+
+| Path | Median |
+|---|---|
+| `deserialize` + `htr`, preset statically known | 117.8 + 164.7 = 282.5 ms |
+| `ForkInterface.stateRoot`, preset injected at runtime | 282.8 ms |
+
+The seam costs 0.3 ms on 282 ms, which is 0.1%. There is no dispatch
+overhead left for a `@[specialize]` hint to remove.
+
+**The hint experiment, and why it was reverted.** The one genuinely
+preset-generic layer in a fork body is the `ForkInterface` implementation
+set, whose members take the preset and the config as explicit value
+arguments. `@[specialize]` on Gloas's `decodeState`, `stateRootImpl`,
+and `runBlocksImpl` is therefore the strongest pass-2 hint available.
+Measured back to back on one machine
+(`bench/specs-profile-20260912T041020Z-specialize-interface-impls.tsv`):
+
+| Row | No hint | Hinted | Change |
+|---|---|---|---|
+| `ForkInterface.stateRoot BeaconState` | 282.8 ms | 281.5 ms | −0.5% |
+| `ForkInterface.runBlocks` (whole vector) | 363.0 ms | 360.0 ms | −0.8% |
+
+Both moves sit inside this machine's run-to-run drift. Rows no hint
+can touch move further across the same pair: `deserialize
+BeaconBlockHeader ×1000` by +4.7%, `deserialize Attestation ×1000` by
+−2.5%. Three repeat runs per configuration put the spread at roughly
+±2%, so a 0.5% move is not a win. Under this section's own rule, keep
+a hint only when it shows a win, the hints are reverted and pass 2
+lands no annotation.
+
+**Why the ceiling is this low.** Pass 1 already removed the
+instance dispatch at the three entry points, and the cost that
+remains inside them is the `SSZType` interpreter walking a *runtime
+value*: `SSZ.hashTreeRoot` dispatches on `r.shape`, a term, not on a
+type. No attribute monomorphises a function over a value argument.
+Removing that layer needs the shape resolved at elaboration time,
+which is a change to the deriving handler's output rather than an
+annotation, and a separate stage.
+
+**What the profile found instead: `serialize` is quadratic in
+element count.** The largest row is not a dispatch cost at all.
+`serialize BeaconState` takes 3.4 s, 21 times the 164.7 ms its
+hash-tree-root costs, for a 3.17 MB value. `SSZType.serializeFixedElems`
+(`Spec/Serialize.lean`) is a right fold of `ByteArray.append`:
+
+```lean
+| t, x :: xs => SSZType.serialize t x ++ SSZType.serializeFixedElems t xs
+```
+
+Every `++` copies the whole accumulated suffix, so a vector of `n`
+fixed-size elements copies `O(n²)` bytes. `BeaconState.randaoMixes` is
+a `Vector Bytes32 65536` at mainnet, which alone accounts for tens of
+gigabytes of copying. The fix is an accumulator that appends into one
+buffer, and it belongs to a SizzLean stage of its own: the function
+carries proof obligations, and the change is library-side, outside
+this sub-stage's scope. Recorded here as the profile's finding, with
+its measurement, rather than folded into pass 2.
 
 **Original design notes follow.**
 
@@ -1146,7 +1283,7 @@ optimisation preserves that property:
 |---|---|
 | 17a Overlay | Touches `TreeBacked` directly. `UncachedSSZ` has no spine to defer; plain `T` doesn't have a pending-writes map either. |
 | 17b Batched SHA-256 | Wired as an `@[implemented_by]` swap on `merkleRootWithCache` (or behind `Hasher Sha256`). The abstract `Hasher` typeclass and the `Sha256Spec` instance are unchanged. |
-| 17c Hash-consing | Operates on `Node` allocations. The pure spec path doesn't allocate `Node`s, it hashes through the `SSZType` recursion directly. |
+| 17c Hash-consing | Operates on `Node` allocations behind a per-box flag. The pure spec path doesn't allocate `Node`s, it hashes through the `SSZType` recursion directly. |
 | 17d `@[specialize]` | Compile-time recommendation. Lean's kernel sees the unspecialised definition for proof reduction; `rfl` / `decide` close identically before and after. |
 | 17e Serialised cache | Slot on `TreeBacked` only. `UncachedSSZ` doesn't have it; `SSZ.serialize` on plain `T` doesn't consult it. |
 
@@ -1214,3 +1351,6 @@ that should be paid for by measured gain.
 | Coherence property test | `SizzLeanTests/TreeBackedCoherence.lean` |
 | Setter / index property tests | `SizzLeanTests/TreeBackedSetField.lean`, `MultiSetterIndex.lean` |
 | Cache research notes (deeper rationale) | [`research/cache-research.md`](research/cache-research.md) |
+| SizzLean microbenchmarks (`just sizzlean-bench`) | `SizzLeanBench/` |
+| Consensus container profile (`just ethcl-profile`) | `packages/EthCLSpecs/EthCLSpecsBench/` |
+| Bench and profile TSVs | `bench/` |
